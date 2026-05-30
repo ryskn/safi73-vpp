@@ -10,18 +10,41 @@ import (
 // Reconciler は Source から受けた SR Policy イベントを Programmer に反映する。
 // 具体実装に依存しないため、テストでは fake を注入できる。
 type Reconciler struct {
-	source Source
-	prog   Programmer
-	store  Store
-	log    *slog.Logger
+	source    Source
+	prog      Programmer
+	store     Store
+	transform PolicyTransform
+	log       *slog.Logger
+}
+
+// Option は Reconciler の任意設定。
+type Option func(*Reconciler)
+
+// WithTransform は投入前の Policy 変換を差し込む(既定は無変換)。
+func WithTransform(t PolicyTransform) Option {
+	return func(r *Reconciler) {
+		if t != nil {
+			r.transform = t
+		}
+	}
 }
 
 // NewReconciler は依存(供給源・投入先・状態ストア・logger)を注入して生成する。
-func NewReconciler(src Source, prog Programmer, store Store, log *slog.Logger) *Reconciler {
+func NewReconciler(src Source, prog Programmer, store Store, log *slog.Logger, opts ...Option) *Reconciler {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Reconciler{source: src, prog: prog, store: store, log: log}
+	r := &Reconciler{
+		source:    src,
+		prog:      prog,
+		store:     store,
+		transform: identityTransform{},
+		log:       log,
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Run はイベント購読を開始し、ctx 終了まで反映し続ける。
@@ -31,13 +54,16 @@ func (r *Reconciler) Run(ctx context.Context) error {
 
 // apply は 1 イベントを処理する。Subscribe から逐次(単一 goroutine)で呼ばれる前提。
 func (r *Reconciler) apply(ev srpolicy.Event) {
-	p := ev.Policy
-	key := p.Key()
-
+	// withdraw は NLRI のキーだけで引けるため変換不要。
 	if ev.Withdraw {
-		r.withdraw(key)
+		r.withdraw(ev.Policy.Key())
 		return
 	}
+
+	// 投入前の変換(uSID 圧縮など)。変換は NLRI キーを変えない。
+	p := r.transform.Apply(ev.Policy)
+	key := p.Key()
+
 	if err := p.ValidateSRv6(); err != nil {
 		r.log.Warn("skip policy", "key", key, "reason", err)
 		return

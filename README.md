@@ -31,22 +31,24 @@ gobgpd ──gRPC WatchEvent──▶ safi73-vppd ──govpp──▶ VPP /run/
     internal/srpolicy      ドメイン (Policy / SegmentList / Event)。依存ゼロ
 
 
-  抽象 (control が定義)  ←─  実装 (adapter は control を import せず暗黙的に満たす)
+  抽象 (control が定義)    ←─  実装 (adapter は control を import せず暗黙的に満たす)
 
-    control.Source        ←─  adapter/bgp.Source        gobgpd gRPC WatchEvent を購読
-    control.Programmer    ←─  adapter/vpp.Programmer    govpp で sr_policy_add/mod/del
-    control.Store         ←─  control.MemStore          投入済み Policy をインメモリ追跡
+    control.Source          ←─  adapter/bgp.Source       gobgpd gRPC WatchEvent を購読
+    control.Programmer      ←─  adapter/vpp.Programmer    govpp で sr_policy_add/mod/del
+    control.Store           ←─  control.MemStore          投入済み Policy をインメモリ追跡
+    control.PolicyTransform ←─  usid.Compactor            uSID を carrier に圧縮 (任意/OCP)
 
 
   データの流れ (runtime)
 
     gobgpd ─▶ adapter/bgp.Source ─▶ control.Reconciler ─▶ adapter/vpp.Programmer ─▶ VPP
+                                         │ (任意) PolicyTransform: usid.Compactor
 ```
 
 | 原則 | 反映箇所 |
 |------|----------|
 | **S** 単一責任 | `srpolicy`(モデル) / `control`(制御) / `adapter/bgp`(購読・デコード) / `adapter/vpp`(投入) / `MemStore`(状態) を分離 |
-| **O** 開放閉鎖 | 供給源・投入先・状態ストアを差し替え可能。SR-MPLS 投入や別の経路源を足しても `Reconciler` は無変更 |
+| **O** 開放閉鎖 | 投入前に `PolicyTransform` を差し込める。例: `usid.Compactor` で uSID 圧縮を `Reconciler` 無変更で追加。供給源・投入先・状態ストアも差し替え可能 |
 | **L** リスコフ | `Source`/`Programmer`/`Store` のどの実装でも `Reconciler` は同じ契約で動く(fake で代替してテスト) |
 | **I** インターフェース分離 | `Programmer` は `Add`/`Remove` のみ等、利用側が必要とする最小の口だけを定義 |
 | **D** 依存性逆転 | `Reconciler` は具象(gobgp/VPP)を知らず抽象のみに依存。結線は composition root に集約 |
@@ -61,9 +63,12 @@ internal/srpolicy/        ドメイン層 (gobgp/VPP 非依存)
   policy.go               Policy / SegmentList / Key / ValidateSRv6
   event.go                Event (追加/withdraw)
 internal/control/         制御層 (抽象のみに依存)
-  ports.go                Source / Programmer / Store インターフェース
-  reconciler.go           Reconciler: イベント→データプレーン反映 (更新は冪等)
+  ports.go                Source / Programmer / Store / PolicyTransform インターフェース
+  reconciler.go           Reconciler: イベント→(変換)→データプレーン反映 (更新は冪等)
   memstore.go             MemStore: Store のインメモリ実装
+internal/usid/            uSID (micro-SID) サポート
+  usid.go                 Block: uSID を 128bit carrier に圧縮する純ロジック
+  transform.go            Compactor: control.PolicyTransform 実装
 internal/adapter/bgp/     control.Source 実装
   source.go               gobgpd gRPC WatchEvent 購読 + SAFI73 選別
   decode.go               api.Path → srpolicy.Event
@@ -87,6 +92,25 @@ binapi/                   VPP 26.02 の /usr/share/vpp/api から生成した go
 | withdraw | `sr_policy_del` (BSID 指定) |
 
 SegmentTypeA (SR-MPLS label) は対象外 (SRv6 dataplane のみ)。BSID が無い/IPv6 でない経路は skip。
+
+## uSID (micro-SID)
+
+`-usid-block <prefix>` を指定すると、BGP で受けた segment list 中の per-node uSID
+(block 配下の単一 uSID アドレス) を 128bit の uSID carrier に圧縮してから VPP に投入する。
+
+```sh
+safi73-vppd -usid-block fcbb:bb00::/32 -usid-len 16   # block /32 + 16bit uSID → 1 carrier に最大 6 個
+```
+
+例: BGP segment list `[fcbb:bb00:1::, fcbb:bb00:2::, fcbb:bb00:3::]`
+→ 圧縮 → VPP の SID リストは `[fcbb:bb00:1:2:3::]` (1 carrier)。単一 carrier なので
+VPP は **SRH 無し (reduced encap)** で carrier を outer DA に載せる。中継ノードは
+`sr localsid prefix fcbb:bb00:1::/48 behavior un 16` (uN) で先頭 uSID を pop し、
+DA を `fcbb:bb00:2:3::` にシフトして転送する。
+
+圧縮ロジックは `internal/usid` の純関数 (byte 境界の block/uSID 長に対応、単体テスト済み)。
+それを `control.PolicyTransform` として composition root で注入するだけで、圧縮無効時 (既定) の
+挙動は一切変わらない (OCP)。実機で headend 圧縮 → reduced encap → uN シフトまで確認済み。
 
 ## ビルド / テスト
 

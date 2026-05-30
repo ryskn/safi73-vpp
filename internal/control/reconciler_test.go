@@ -92,3 +92,28 @@ func TestWithdrawUnknownIsNoop(t *testing.T) {
 		t.Fatalf("removed=%d, want 0", len(fp.removed))
 	}
 }
+
+// markTransform は変換が確かに適用されるか確認するための fake。
+type markTransform struct{ called *int }
+
+func (m markTransform) Apply(p srpolicy.Policy) srpolicy.Policy {
+	*m.called++
+	p.BSID = mustAddr("2001:db8:b::ff") // 変換結果が投入されることを示す
+	return p
+}
+
+func TestTransformIsApplied(t *testing.T) {
+	called := 0
+	fp := &fakeProgrammer{}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{{Policy: policy(100, "2001:db8:b::1")}}},
+		fp, NewMemStore(), nil, WithTransform(markTransform{&called}))
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("transform called %d times, want 1", called)
+	}
+	if len(fp.added) != 1 || fp.added[0].BSID != mustAddr("2001:db8:b::ff") {
+		t.Fatalf("programmed policy did not reflect transform: %+v", fp.added)
+	}
+}
