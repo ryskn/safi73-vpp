@@ -1,17 +1,19 @@
 # safi73-vpp
 
-gobgpd が広告する **BGP SR Policy (SAFI 73)** を購読し、[govpp](https://github.com/FDio/govpp) 経由で
-**VPP の SRv6 SR Policy** として投入/削除する PoC。
+gobgpd が広告する **BGP SR Policy (SAFI 73)** を購読し、**RFC 9256 の SR Policy アーキテクチャ**
+(candidate path 選択) に従って active candidate path を選び、[govpp](https://github.com/FDio/govpp)
+経由で **VPP の SRv6 SR Policy** として instantiate する PoC。
 
 - control-plane: gobgpd (gRPC `WatchEvent`)
+- policy   : RFC 9256 candidate-path 選択 (preference → protocol-origin → originator → discriminator)・妥当性・failover・weighted ECMP
 - data-plane: VPP 26.02 (`sr_policy_add` / `sr_policy_mod` / `sr_policy_del`)
 
 ```
 gobgpd ──gRPC WatchEvent──▶ safi73-vppd ──govpp──▶ VPP /run/vpp/api.sock
-            (SAFI73 best-path)   │
-                                 │ decode  : SRPolicyNLRI(color/endpoint) + TunnelEncap(BSID/segment-list)
-                                 │ reconcile
-                                 └ program : SrPolicyAdd(先頭SL) + SrPolicyMod ADD(追加SL) / withdraw→SrPolicyDel
+       (SAFI73 best-path)        │
+                                 │ decode    : 各 NLRI+attrs を candidate path 化 (color/endpoint で SR Policy にまとめる)
+                                 │ select     : RFC 9256 §2.9 で active candidate path を選ぶ
+                                 └ program  : active CP のみ SrPolicyAdd(+Mod で weighted SL) / 切替・無効化→SrPolicyDel
 ```
 
 ## 設計 (SOLID)
@@ -25,47 +27,50 @@ gobgpd ──gRPC WatchEvent──▶ safi73-vppd ──govpp──▶ VPP /run/
     cmd/safi73-vppd        composition root。具象を生成し Reconciler に注入する
           │ inject
           ▼
-    control.Reconciler     反映ロジック。Source / Programmer / Store の抽象だけに依存
+    control.Reconciler     candidate path 集約＋active 選択＋反映。Source/Programmer/Transform の抽象だけに依存
           │ uses
           ▼
-    internal/srpolicy      ドメイン (Policy / SegmentList / Event)。依存ゼロ
+    internal/srpolicy      ドメイン (CandidatePath / SelectActive など)。依存ゼロ
 
 
   抽象 (control が定義)    ←─  実装 (adapter は control を import せず暗黙的に満たす)
 
     control.Source          ←─  adapter/bgp.Source       gobgpd gRPC WatchEvent を購読
     control.Programmer      ←─  adapter/vpp.Programmer    govpp で sr_policy_add/mod/del
-    control.Store           ←─  control.MemStore          投入済み Policy をインメモリ追跡
     control.PolicyTransform ←─  usid.Compactor            uSID を carrier に圧縮 (任意/OCP)
 
 
   データの流れ (runtime)
 
     gobgpd ─▶ adapter/bgp.Source ─▶ control.Reconciler ─▶ adapter/vpp.Programmer ─▶ VPP
-                                         │ (任意) PolicyTransform: usid.Compactor
+                                    │ select active CP (srpolicy.SelectActive)
+                                    │ (任意) PolicyTransform: usid.Compactor
 ```
+
+candidate path の選択は純関数 `srpolicy.SelectActive` (ドメイン層) に切り出し、`Reconciler` は
+その結果を VPP との差分に落とすだけ。状態 (SR Policy ごとの CP 集合と active) は `Reconciler` が保持する。
 
 | 原則 | 反映箇所 |
 |------|----------|
-| **S** 単一責任 | `srpolicy`(モデル) / `control`(制御) / `adapter/bgp`(購読・デコード) / `adapter/vpp`(投入) / `MemStore`(状態) を分離 |
-| **O** 開放閉鎖 | 投入前に `PolicyTransform` を差し込める。例: `usid.Compactor` で uSID 圧縮を `Reconciler` 無変更で追加。供給源・投入先・状態ストアも差し替え可能 |
-| **L** リスコフ | `Source`/`Programmer`/`Store` のどの実装でも `Reconciler` は同じ契約で動く(fake で代替してテスト) |
+| **S** 単一責任 | `srpolicy`(モデル＋選択) / `control`(反映と状態) / `adapter/bgp`(購読・デコード) / `adapter/vpp`(投入) / `usid`(圧縮) を分離 |
+| **O** 開放閉鎖 | 投入前に `PolicyTransform` を差し込める。例: `usid.Compactor` で uSID 圧縮を `Reconciler` 無変更で追加。供給源・投入先も差し替え可能 |
+| **L** リスコフ | `Source`/`Programmer` のどの実装でも `Reconciler` は同じ契約で動く(fake で代替してテスト) |
 | **I** インターフェース分離 | `Programmer` は `Add`/`Remove` のみ等、利用側が必要とする最小の口だけを定義 |
 | **D** 依存性逆転 | `Reconciler` は具象(gobgp/VPP)を知らず抽象のみに依存。結線は composition root に集約 |
 
-抽象(`Source`/`Programmer`/`Store`)は利用側 `control` パッケージが定義し、adapter 側が暗黙的に満たす
+抽象(`Source`/`Programmer`/`PolicyTransform`)は利用側 `control` が定義し、adapter 側が暗黙的に満たす
 (Go 的な DIP)。adapter は `srpolicy` ドメインにのみ依存し、`control` を import しない。
 
 ## レイアウト
 
 ```
 internal/srpolicy/        ドメイン層 (gobgp/VPP 非依存)
-  policy.go               Policy / SegmentList / Key / ValidateSRv6
-  event.go                Event (追加/withdraw)
+  policy.go               PolicyKey / CandidatePath / SegmentList / Originator / 妥当性
+  selection.go            SelectActive: RFC 9256 §2.9 の active CP 選択 (純関数)
+  event.go                Event (candidate path の追加/withdraw)
 internal/control/         制御層 (抽象のみに依存)
-  ports.go                Source / Programmer / Store / PolicyTransform インターフェース
-  reconciler.go           Reconciler: イベント→(変換)→データプレーン反映 (更新は冪等)
-  memstore.go             MemStore: Store のインメモリ実装
+  ports.go                Source / Programmer / PolicyTransform インターフェース
+  reconciler.go           Reconciler: CP 集約 → active 選択 → 差分を VPP へ反映 (failover 含む)
 internal/usid/            uSID (micro-SID) サポート
   usid.go                 Block: uSID を 128bit carrier に圧縮する純ロジック
   transform.go            Compactor: control.PolicyTransform 実装
@@ -81,17 +86,52 @@ cmd/smoke/                govpp↔VPP 疎通確認
 binapi/                   VPP 26.02 の /usr/share/vpp/api から生成した govpp バインディング
 ```
 
-## マッピング
+## SR Policy アーキテクチャ (RFC 9256)
 
-| BGP SR Policy | VPP |
+受信した各 BGP 経路を **candidate path** に変換し、SR Policy `<color, endpoint>` ごとにまとめて、
+妥当な CP の中から **active candidate path** を 1 本選んで instantiate する。複数 controller / 複数
+candidate path が同じ SR Policy を広告しても、RFC 9256 のルールで 1 本に収束させるのが headend の責務。
+
+**candidate path の識別** (RFC 9256 §2.3 / BGP マッピング)
+
+| RFC 9256 | 由来 (BGP) |
 |---|---|
-| NLRI (distinguisher, color, endpoint) | 状態追跡キー (withdraw 用) |
-| Tunnel Encap / Binding SID sub-TLV | `bsid_addr` (SR Policy のキー) |
-| Segment List sub-TLV (SegmentTypeB = SRv6 SID) | `Srv6SidList` |
-| 2 本目以降の Segment List | `sr_policy_mod` operation=ADD |
-| withdraw | `sr_policy_del` (BSID 指定) |
+| SR Policy = `<color, endpoint>` | NLRI の color / endpoint |
+| Protocol-Origin | BGP = `20` 固定 |
+| Originator `<ASN, node>` | 経路の source-AS / source-id |
+| Discriminator | NLRI の distinguisher |
+| Preference / Priority / BSID / Segment List | Tunnel Encap sub-TLV |
 
-SegmentTypeA (SR-MPLS label) は対象外 (SRv6 dataplane のみ)。BSID が無い/IPv6 でない経路は skip。
+**active candidate path 選択** (§2.9) — 妥当な CP のうち:
+
+1. **Preference** が高いもの
+2. (同値) **Protocol-Origin** が高いもの (PCEP=10 < BGP=20 < Config=30)
+3. (同値) 既存導入 CP を優先 (フラップ抑制)
+4. (同値) **Originator** が低いもの (160bit = ASN+node)
+5. (同値) **Discriminator** が高いもの
+
+**妥当性** (§5.1): SID-list は 空 / weight==0 / SR-MPLSとSRv6混在 で無効。CP は妥当な SID-list を
+1 本以上持てば valid。SR Policy は妥当な CP を 1 本以上持てば up。無効・全 withdraw なら down (VPP から削除)。
+**weighted ECMP** (§2.11): active CP の各 SID-list を weight `w/Σw` で負荷分散 (VPP の `Srv6SidList.weight`)。
+
+**VPP マッピング**
+
+| 要素 | VPP |
+|---|---|
+| active CP の Binding SID | `bsid_addr` (SR Policy のキー) |
+| Segment List (SegmentTypeB = SRv6 SID) | `Srv6SidList` |
+| 2 本目以降の Segment List (weighted) | `sr_policy_mod` operation=ADD |
+| active CP 切替 / 無効化 / withdraw | 旧 BSID を `sr_policy_del` → 新 BSID を `sr_policy_add` |
+
+SegmentTypeA (SR-MPLS label) は対象外 (SRv6 dataplane のみ)。BSID が無い/IPv6 でない CP は無効扱い。
+
+### 実機確認済みの挙動
+
+- preference 違いの 2 CP → 高い方が active
+- 高 preference だが **無効 (weight 0)** な CP → 選ばれない (妥当性ゲート)
+- active CP を withdraw → 無効 CP を飛ばして次点へ **failover**
+- 全 CP withdraw → SR Policy down (VPP から消える)
+- 1 CP に weight 1 / 3 の 2 SID-list → VPP に両方 (1:3 分散)
 
 ## uSID (micro-SID)
 

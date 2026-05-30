@@ -1,5 +1,5 @@
-// inject-srpolicy: テスト用。gobgpd の gRPC API に SRv6 SR Policy (SAFI 73) を 1 本
-// 注入(または withdraw)する。safi73-vppd の動作確認に使う。
+// inject-srpolicy: テスト用。gobgpd の gRPC API に SRv6 SR Policy (SAFI 73) を 1 candidate
+// path 注入(または withdraw)する。複数 SID-list(weighted ECMP)に対応。
 package main
 
 import (
@@ -7,6 +7,7 @@ import (
 	"flag"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,12 +19,14 @@ import (
 func main() {
 	addr := flag.String("gobgp", "127.0.0.1:50051", "gobgpd gRPC API")
 	color := flag.Uint("color", 100, "SR Policy color")
-	dist := flag.Uint("distinguisher", 1, "SR Policy distinguisher")
+	dist := flag.Uint("distinguisher", 1, "candidate path distinguisher")
 	endpoint := flag.String("endpoint", "2001:db8::1", "SR Policy endpoint (IPv6)")
 	nexthop := flag.String("nexthop", "2001:db8::1", "next-hop (IPv6)")
 	bsid := flag.String("bsid", "2001:db8:b::1", "Binding SID (IPv6)")
-	segs := flag.String("segments", "2001:db8:cafe::1,2001:db8:cafe::2", "SRv6 SID list (comma separated)")
+	segs := flag.String("segments", "2001:db8:cafe::1,2001:db8:cafe::2", "SID-list。';' で複数 SID-list (weighted ECMP) を区切る")
+	weights := flag.String("weights", "", "各 SID-list の weight (カンマ区切り 例 1,3)。省略時は全て 1")
 	pref := flag.Uint("preference", 100, "SR Policy preference")
+	prio := flag.Uint("priority", 0, "SR Policy priority")
 	withdraw := flag.Bool("withdraw", false, "withdraw instead of add")
 	flag.Parse()
 
@@ -35,57 +38,68 @@ func main() {
 	client := api.NewGoBgpServiceClient(conn)
 
 	nlri := &api.NLRI{Nlri: &api.NLRI_SrPolicy{SrPolicy: &api.SRPolicyNLRI{
-		Length:        192, // bits: distinguisher(4)+color(4)+endpoint(16) = 24B
+		Length:        192,
 		Distinguisher: uint32(*dist),
 		Color:         uint32(*color),
 		Endpoint:      net.ParseIP(*endpoint).To16(),
 	}}}
 
-	var segList []*api.TunnelEncapSubTLVSRSegmentList_Segment
-	for _, s := range strings.Split(*segs, ",") {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		segList = append(segList, &api.TunnelEncapSubTLVSRSegmentList_Segment{
-			Segment: &api.TunnelEncapSubTLVSRSegmentList_Segment_B{
-				B: &api.SegmentTypeB{
-					Flags: &api.SegmentFlags{},
-					Sid:   net.ParseIP(s).To16(),
-					EndpointBehaviorStructure: &api.SRv6EndPointBehavior{
-						Behavior: api.SRV6Behavior_SRV6_BEHAVIOR_END_DT6,
+	wlist := strings.Split(*weights, ",")
+	subTLVs := []*api.TunnelEncapTLV_TLV{
+		{Tlv: &api.TunnelEncapTLV_TLV_SrPreference{
+			SrPreference: &api.TunnelEncapSubTLVSRPreference{Preference: uint32(*pref)},
+		}},
+		{Tlv: &api.TunnelEncapTLV_TLV_SrPriority{
+			SrPriority: &api.TunnelEncapSubTLVSRPriority{Priority: uint32(*prio)},
+		}},
+		{Tlv: &api.TunnelEncapTLV_TLV_SrBindingSid{
+			SrBindingSid: &api.TunnelEncapSubTLVSRBindingSID{
+				Bsid: &api.TunnelEncapSubTLVSRBindingSID_SrBindingSid{
+					SrBindingSid: &api.SRBindingSID{Sid: net.ParseIP(*bsid).To16()},
+				},
+			},
+		}},
+	}
+	for i, group := range strings.Split(*segs, ";") {
+		var segList []*api.TunnelEncapSubTLVSRSegmentList_Segment
+		for _, s := range strings.Split(group, ",") {
+			if s = strings.TrimSpace(s); s == "" {
+				continue
+			}
+			segList = append(segList, &api.TunnelEncapSubTLVSRSegmentList_Segment{
+				Segment: &api.TunnelEncapSubTLVSRSegmentList_Segment_B{
+					B: &api.SegmentTypeB{
+						Flags: &api.SegmentFlags{},
+						Sid:   net.ParseIP(s).To16(),
+						EndpointBehaviorStructure: &api.SRv6EndPointBehavior{
+							Behavior: api.SRV6Behavior_SRV6_BEHAVIOR_END_DT6,
+						},
 					},
+				},
+			})
+		}
+		w := uint32(1)
+		if i < len(wlist) {
+			if v, err := strconv.Atoi(strings.TrimSpace(wlist[i])); err == nil && v >= 0 {
+				w = uint32(v)
+			}
+		}
+		subTLVs = append(subTLVs, &api.TunnelEncapTLV_TLV{
+			Tlv: &api.TunnelEncapTLV_TLV_SrSegmentList{
+				SrSegmentList: &api.TunnelEncapSubTLVSRSegmentList{
+					Weight:   &api.SRWeight{Weight: w},
+					Segments: segList,
 				},
 			},
 		})
 	}
 
-	tunnelEncap := &api.TunnelEncapAttribute{Tlvs: []*api.TunnelEncapTLV{{
-		Type: 15, // TUNNEL_TYPE_SR_POLICY
-		Tlvs: []*api.TunnelEncapTLV_TLV{
-			{Tlv: &api.TunnelEncapTLV_TLV_SrPreference{
-				SrPreference: &api.TunnelEncapSubTLVSRPreference{Preference: uint32(*pref)},
-			}},
-			{Tlv: &api.TunnelEncapTLV_TLV_SrBindingSid{
-				SrBindingSid: &api.TunnelEncapSubTLVSRBindingSID{
-					Bsid: &api.TunnelEncapSubTLVSRBindingSID_SrBindingSid{
-						SrBindingSid: &api.SRBindingSID{Sid: net.ParseIP(*bsid).To16()},
-					},
-				},
-			}},
-			{Tlv: &api.TunnelEncapTLV_TLV_SrSegmentList{
-				SrSegmentList: &api.TunnelEncapSubTLVSRSegmentList{
-					Weight:   &api.SRWeight{Weight: 1},
-					Segments: segList,
-				},
-			}},
-		},
-	}}}
-
 	pattrs := []*api.Attribute{
 		{Attr: &api.Attribute_Origin{Origin: &api.OriginAttribute{Origin: 0}}},
 		{Attr: &api.Attribute_NextHop{NextHop: &api.NextHopAttribute{NextHop: *nexthop}}},
-		{Attr: &api.Attribute_TunnelEncap{TunnelEncap: tunnelEncap}},
+		{Attr: &api.Attribute_TunnelEncap{TunnelEncap: &api.TunnelEncapAttribute{
+			Tlvs: []*api.TunnelEncapTLV{{Type: 15, Tlvs: subTLVs}},
+		}}},
 	}
 
 	path := &api.Path{
@@ -98,24 +112,19 @@ func main() {
 	defer cancel()
 
 	if *withdraw {
-		_, err = client.DeletePath(ctx, &api.DeletePathRequest{
-			TableType: api.TableType_TABLE_TYPE_GLOBAL,
-			Path:      path,
-		})
-		if err != nil {
+		if _, err := client.DeletePath(ctx, &api.DeletePathRequest{
+			TableType: api.TableType_TABLE_TYPE_GLOBAL, Path: path,
+		}); err != nil {
 			log.Fatalf("DeletePath: %v", err)
 		}
-		log.Printf("withdrew SR Policy color=%d endpoint=%s bsid=%s", *color, *endpoint, *bsid)
+		log.Printf("withdrew CP color=%d disc=%d bsid=%s", *color, *dist, *bsid)
 		return
 	}
-
-	resp, err := client.AddPath(ctx, &api.AddPathRequest{
-		TableType: api.TableType_TABLE_TYPE_GLOBAL,
-		Path:      path,
-	})
-	if err != nil {
+	if _, err := client.AddPath(ctx, &api.AddPathRequest{
+		TableType: api.TableType_TABLE_TYPE_GLOBAL, Path: path,
+	}); err != nil {
 		log.Fatalf("AddPath: %v", err)
 	}
-	log.Printf("added SR Policy color=%d endpoint=%s bsid=%s segs=%q uuid=%x",
-		*color, *endpoint, *bsid, *segs, resp.GetUuid())
+	log.Printf("added CP color=%d disc=%d pref=%d bsid=%s segs=%q weights=%q",
+		*color, *dist, *pref, *bsid, *segs, *weights)
 }

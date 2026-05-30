@@ -1,7 +1,9 @@
 package srpolicy
 
-// Event は制御プレーンから届く SR Policy の更新通知(追加/更新 or 取り消し)。
+// Event は制御プレーンから届く candidate path の更新通知。
+// Key はその CP が属する SR Policy <color, endpoint>。
 type Event struct {
-	Policy   Policy
+	Key      PolicyKey
+	Path     CandidatePath
 	Withdraw bool
 }

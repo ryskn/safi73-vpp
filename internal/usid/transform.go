@@ -8,12 +8,12 @@ type Compactor struct {
 	Block Block
 }
 
-// Apply は各 segment list の SID 列を uSID carrier に圧縮した Policy を返す。
-// 元の Policy は変更しない。
-func (c Compactor) Apply(p srpolicy.Policy) srpolicy.Policy {
-	out := p
-	out.SegmentLists = make([]srpolicy.SegmentList, len(p.SegmentLists))
-	for i, sl := range p.SegmentLists {
+// Apply は各 segment list の SID 列を uSID carrier に圧縮した CandidatePath を返す。
+// 元の値は変更しない。
+func (c Compactor) Apply(cp srpolicy.CandidatePath) srpolicy.CandidatePath {
+	out := cp
+	out.SegmentLists = make([]srpolicy.SegmentList, len(cp.SegmentLists))
+	for i, sl := range cp.SegmentLists {
 		out.SegmentLists[i] = srpolicy.SegmentList{
 			Weight: sl.Weight,
 			SIDs:   c.Block.Compact(sl.SIDs),

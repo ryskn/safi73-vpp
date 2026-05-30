@@ -1,8 +1,8 @@
-// safi73-vppd: gobgpd が広告する SR Policy (SAFI 73) を購読し、govpp 経由で
-// VPP の SRv6 SR Policy として投入/削除する daemon。
+// safi73-vppd: gobgpd が広告する SR Policy (SAFI 73) を購読し、RFC 9256 の
+// candidate-path 選択を行って active CP を govpp 経由で VPP に instantiate する daemon。
 //
-// このファイルは composition root。具体実装(bgp.Source / vpp.Programmer)と任意の
-// 変換(usid.Compactor)を生成し、抽象にのみ依存する control.Reconciler に注入する。
+// composition root: 具象(bgp.Source / vpp.Programmer)と任意の変換(usid.Compactor)を
+// 生成し、抽象にのみ依存する control.Reconciler に注入する。
 package main
 
 import (
@@ -65,7 +65,7 @@ func main() {
 		log.Info("uSID compaction enabled", "block", pfx, "usid_bits", *usidLen, "per_carrier", blk.PerCarrier())
 	}
 
-	rec := control.NewReconciler(src, prog, control.NewMemStore(), log, opts...)
+	rec := control.NewReconciler(src, prog, log, opts...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

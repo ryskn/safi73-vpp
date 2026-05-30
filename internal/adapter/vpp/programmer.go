@@ -22,7 +22,7 @@ type Options struct {
 }
 
 // Programmer は govpp channel 越しに VPP の SRv6 SR Policy を操作する。
-// 具体接続ではなく govppapi.Channel(インターフェース)に依存するため、テスト可能。
+// govppapi.Channel(インターフェース)に依存するため、テスト可能。
 type Programmer struct {
 	ch   govppapi.Channel
 	opts Options
@@ -33,27 +33,31 @@ func NewProgrammer(ch govppapi.Channel, opts Options) *Programmer {
 	return &Programmer{ch: ch, opts: opts}
 }
 
-// Add は SR Policy を投入する。先頭 segment list を sr_policy_add で作り、
-// 2 本目以降は sr_policy_mod(ADD) で同じ BSID に追加する。
-func (p *Programmer) Add(pol srpolicy.Policy) error {
-	bsid := toIP6(pol.BSID)
+// Add は active candidate path を投入する。先頭 SID-list を sr_policy_add で作り、
+// 2 本目以降(weighted ECMP)は sr_policy_mod(ADD) で同じ BSID に追加する。
+func (p *Programmer) Add(cp srpolicy.CandidatePath) error {
+	sls := cp.ValidSegmentLists()
+	if len(sls) == 0 {
+		return fmt.Errorf("candidate path bsid=%s has no valid segment list", cp.BSID)
+	}
+	bsid := toIP6(cp.BSID)
 
 	reply := &sr.SrPolicyAddReply{}
 	if err := p.ch.SendRequest(&sr.SrPolicyAdd{
 		BsidAddr: bsid,
-		Weight:   pol.SegmentLists[0].Weight,
+		Weight:   sls[0].Weight,
 		IsEncap:  p.opts.Encap,
 		FibTable: p.opts.FIBTable,
-		Sids:     sidList(pol.SegmentLists[0]),
+		Sids:     sidList(sls[0]),
 	}).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("sr_policy_add bsid=%s: %w", pol.BSID, err)
+		return fmt.Errorf("sr_policy_add bsid=%s: %w", cp.BSID, err)
 	}
 	if reply.Retval != 0 {
-		return fmt.Errorf("sr_policy_add bsid=%s retval=%d", pol.BSID, reply.Retval)
+		return fmt.Errorf("sr_policy_add bsid=%s retval=%d", cp.BSID, reply.Retval)
 	}
 
-	for i := 1; i < len(pol.SegmentLists); i++ {
-		if err := p.addSegmentList(bsid, pol.SegmentLists[i]); err != nil {
+	for i := 1; i < len(sls); i++ {
+		if err := p.addSegmentList(bsid, sls[i]); err != nil {
 			return err
 		}
 	}
@@ -78,15 +82,15 @@ func (p *Programmer) addSegmentList(bsid ip_types.IP6Address, sl srpolicy.Segmen
 }
 
 // Remove は BSID をキーに SR Policy を削除する。
-func (p *Programmer) Remove(pol srpolicy.Policy) error {
+func (p *Programmer) Remove(cp srpolicy.CandidatePath) error {
 	reply := &sr.SrPolicyDelReply{}
 	if err := p.ch.SendRequest(&sr.SrPolicyDel{
-		BsidAddr: toIP6(pol.BSID),
+		BsidAddr: toIP6(cp.BSID),
 	}).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("sr_policy_del bsid=%s: %w", pol.BSID, err)
+		return fmt.Errorf("sr_policy_del bsid=%s: %w", cp.BSID, err)
 	}
 	if reply.Retval != 0 {
-		return fmt.Errorf("sr_policy_del bsid=%s retval=%d", pol.BSID, reply.Retval)
+		return fmt.Errorf("sr_policy_del bsid=%s retval=%d", cp.BSID, reply.Retval)
 	}
 	return nil
 }
