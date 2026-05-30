@@ -1,0 +1,12 @@
+# build artifacts
+/safi73-vppd
+/smoke
+/inject-srpolicy
+*.test
+*.out
+
+# logs / runtime
+*.log
+
+# OS
+.DS_Store

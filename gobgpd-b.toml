@@ -1,0 +1,15 @@
+[global.config]
+  as = 64515
+  router-id = "192.168.1.115"
+  port = 179
+  local-address-list = ["127.0.0.2"]
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "127.0.0.1"
+    peer-as = 64514
+  [neighbors.transport.config]
+    local-address = "127.0.0.2"
+  [[neighbors.afi-safis]]
+    [neighbors.afi-safis.config]
+      afi-safi-name = "ipv6-srpolicy"
