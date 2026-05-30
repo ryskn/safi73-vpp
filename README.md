@@ -16,19 +16,31 @@ gobgpd ──gRPC WatchEvent──▶ safi73-vppd ──govpp──▶ VPP /run/
 
 ## 設計 (SOLID)
 
-レイヤを「ドメイン / 制御 / adapter」に分け、依存方向を内向き(ドメイン)に保つ。
+レイヤを「ドメイン / 制御 / adapter」に分け、依存はすべて内側(ドメイン)へ向かう。
+`Reconciler` は gobgp/VPP の具象を知らず、抽象だけに依存する (依存性逆転)。
 
 ```
-            ┌─────────────────── cmd/safi73-vppd (composition root) ───────────────────┐
-            │  具象を生成して Reconciler に注入するのはここだけ                        │
-            └───────────┬───────────────────────┬──────────────────────┬──────────────┘
-                        ▼                        ▼                      ▼
-        adapter/bgp.Source          control.Reconciler        adapter/vpp.Programmer
-        (control.Source 実装)  ──▶  (抽象のみに依存)    ──▶   (control.Programmer 実装)
-                        │                  │  │                        │
-                        └──────────────────┘  └── control.Store ◀──── control.MemStore
-                                   ▼
-                          internal/srpolicy (ドメイン: 依存ゼロ)
+  レイヤと依存方向 (上 → 下へ依存)
+
+    cmd/safi73-vppd        composition root。具象を生成し Reconciler に注入する
+          │ inject
+          ▼
+    control.Reconciler     反映ロジック。Source / Programmer / Store の抽象だけに依存
+          │ uses
+          ▼
+    internal/srpolicy      ドメイン (Policy / SegmentList / Event)。依存ゼロ
+
+
+  抽象 (control が定義)  ←─  実装 (adapter は control を import せず暗黙的に満たす)
+
+    control.Source        ←─  adapter/bgp.Source        gobgpd gRPC WatchEvent を購読
+    control.Programmer    ←─  adapter/vpp.Programmer    govpp で sr_policy_add/mod/del
+    control.Store         ←─  control.MemStore          投入済み Policy をインメモリ追跡
+
+
+  データの流れ (runtime)
+
+    gobgpd ─▶ adapter/bgp.Source ─▶ control.Reconciler ─▶ adapter/vpp.Programmer ─▶ VPP
 ```
 
 | 原則 | 反映箇所 |
