@@ -38,6 +38,21 @@ type Resyncer interface {
 	RemoveBSID(bsid netip.Addr) error
 }
 
+// SIDResolver は SID の到達性を dataplane の FIB で確認する任意ポート。
+// RFC 9256 §5.1 の first-SID 解決 / V-Flag の SID verification に使う。
+type SIDResolver interface {
+	SIDReachable(sid netip.Addr) (bool, error)
+}
+
+// InvalidDropper は drop-upon-invalid(RFC 9256 §8.2, I-Flag)を実現する任意ポート。
+// policy が invalid の間、endpoint 宛トラフィックを既定経路へ逃さず drop する
+// (fail-closed)。InstallDrop は steering を drop 経路に差し替え、RemoveDrop は
+// それを撤去する(冪等)。
+type InvalidDropper interface {
+	InstallDrop(key srpolicy.PolicyKey) error
+	RemoveDrop(key srpolicy.PolicyKey) error
+}
+
 // PolicyTransform は妥当性判定・選択の前に CP を加工する拡張点(OCP)。uSID 圧縮など。
 // 変換は CP の識別子(protocol-origin / originator / discriminator)と preference を
 // 変えてはならない。SID-list の妥当性(RFC 9256 §5.1)は変換後の姿で判定される。

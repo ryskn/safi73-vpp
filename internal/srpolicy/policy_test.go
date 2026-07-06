@@ -60,6 +60,31 @@ func TestSegmentListValidity(t *testing.T) {
 	}
 }
 
+func TestCandidatePathBSIDValidity(t *testing.T) {
+	base := cp(100, OriginBGP, 1, "2001:db8::1", 1)
+
+	// BSID 未指定は valid (動的割当対象, §6.2.1)。割当可否は headend 側の判定
+	noBSID := base
+	noBSID.BSID = netip.Addr{}
+	if !noBSID.Valid() {
+		t.Error("cp without BSID should be valid (dynamic allocation candidate)")
+	}
+
+	// S-Flag 付きで BSID 未指定は invalid (§6.2.3)
+	sOnly := noBSID
+	sOnly.SpecifiedBSIDOnly = true
+	if sOnly.Valid() {
+		t.Error("S-Flag without BSID must be invalid")
+	}
+
+	// BSID が指定されているのに IPv4 は invalid
+	v4 := base
+	v4.BSID = netip.MustParseAddr("10.0.0.1")
+	if v4.Valid() {
+		t.Error("IPv4 BSID must be invalid")
+	}
+}
+
 func TestSelectHighestPreference(t *testing.T) {
 	a := cp(100, OriginBGP, 1, "2001:db8::1", 1)
 	b := cp(200, OriginBGP, 1, "2001:db8::1", 2)

@@ -139,6 +139,17 @@ func TestPreferenceDefaults100(t *testing.T) {
 	}
 }
 
+// Priority sub-TLV 不在 → 既定 128 (RFC 9256 §2.12)。0 (最高優先) になってはいけない。
+func TestPriorityDefaults128(t *testing.T) {
+	ev := decodeOK(t, srPath(
+		[]*api.TunnelEncapTLV_TLV{bsid13TLV("2001:db8:b::1"), segListTLV(nil, "2001:db8:c::1")},
+		noAdvComm(),
+	))
+	if ev.Path.Priority != srpolicy.DefaultPriority {
+		t.Fatalf("priority=%d, want %d", ev.Path.Priority, srpolicy.DefaultPriority)
+	}
+}
+
 // SRv6 Binding SID sub-TLV (type 20) は gobgp から Unknown で届く。自前パースで拾う。
 func TestSRv6BindingSIDSubTLV(t *testing.T) {
 	ev := decodeOK(t, srPath(
@@ -166,6 +177,16 @@ func TestSRv6BSIDPreferredOverLegacy(t *testing.T) {
 	))
 	if ev.Path.BSID != netip.MustParseAddr("2001:db8:b::20") {
 		t.Fatalf("bsid=%s, want type-20 to win", ev.Path.BSID)
+	}
+}
+
+// V-Flag 付き segment は VerifyMask に記録される。
+func TestVFlagSetsVerifyMask(t *testing.T) {
+	sl := segListTLV(nil, "2001:db8:c::1", "2001:db8:c::2")
+	sl.GetSrSegmentList().Segments[1].GetB().Flags = &api.SegmentFlags{VFlag: true}
+	ev := decodeOK(t, srPath([]*api.TunnelEncapTLV_TLV{bsid13TLV("2001:db8:b::1"), sl}, noAdvComm()))
+	if got := ev.Path.SegmentLists[0].VerifyMask; got != 1<<1 {
+		t.Fatalf("verify mask=%b, want bit1 (second SID)", got)
 	}
 }
 

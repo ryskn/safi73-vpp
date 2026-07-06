@@ -17,6 +17,10 @@ import (
 // DefaultPreference は Preference sub-TLV 不在時の既定値(RFC 9256 §2.7)。
 const DefaultPreference = 100
 
+// DefaultPriority は Priority sub-TLV 不在時の既定値(RFC 9256 §2.12)。
+// priority は「再計算/再検証の処理順」で、値が小さいほど優先(preference とは逆)。
+const DefaultPriority = 128
+
 // MaxSIDsPerList はこの headend が instantiate できる SID 数の上限。
 // VPP binary API の srv6_sid_list が 16 固定のため。超過は RFC 9256 §5.1 の
 // 「headend が解決できない SID-list」として invalid 扱いにする(切り詰め禁止)。
@@ -29,13 +33,19 @@ type SegmentList struct {
 	// Unsupported は SRv6 以外(SR-MPLS 等)の segment type を含んでいたことを示す。
 	// RFC 9256 §5.1: SR-MPLS と SRv6 の混在 list は invalid(部分的に使うのは禁止)。
 	Unsupported bool
+	// VerifyMask は V-Flag(SID verification 要求)が立っていた SID の bit 集合
+	// (bit i = SIDs[i])。first SID は V-Flag に関係なく常に検証対象(§5.1)。
+	VerifyMask uint32
+	// Unresolvable は headend が first SID(または verification 要求 SID)を FIB で
+	// 解決できなかったことを示す(§5.1 → invalid)。到達性検証時に headend が立てる。
+	Unresolvable bool
 }
 
 // Valid は RFC 9256 §5.1 に従い SID-list の妥当性を返す。
-// 空 / weight==0 / 非 IPv6(SRv6でない) SID / 混在 segment type /
+// 空 / weight==0 / 非 IPv6(SRv6でない) SID / 混在 segment type / SID 解決不能 /
 // headend 上限(MaxSIDsPerList)超過は invalid。
 func (sl SegmentList) Valid() bool {
-	if sl.Unsupported || len(sl.SIDs) == 0 || len(sl.SIDs) > MaxSIDsPerList || sl.Weight == 0 {
+	if sl.Unsupported || sl.Unresolvable || len(sl.SIDs) == 0 || len(sl.SIDs) > MaxSIDsPerList || sl.Weight == 0 {
 		return false
 	}
 	for _, s := range sl.SIDs {
@@ -105,7 +115,7 @@ type CandidatePath struct {
 	SegmentLists []SegmentList
 
 	// SpecifiedBSIDOnly は BSID sub-TLV の S-Flag(RFC 9256 §6.2.3)。
-	// この実装は VPP が BSID をキーとする都合で常に Specified-BSID-only 相当で動く。
+	// 立っていると BSID 未指定/割当不可のとき CP を invalid にする(動的割当を許さない)。
 	SpecifiedBSIDOnly bool
 	// DropUponInvalid は BSID sub-TLV の I-Flag(RFC 9256 §8.2)。
 	// VPP dataplane に相当機能が無いため未対応(検出してログのみ)。
@@ -117,14 +127,21 @@ func (cp CandidatePath) Key() CPKey {
 	return CPKey{cp.Origin, cp.Originator.ASN, cp.Originator.Node, cp.Discriminator}
 }
 
+// HasBSID は SRv6 として使える BSID が指定されているかを返す。
+func (cp CandidatePath) HasBSID() bool {
+	return cp.BSID.IsValid() && cp.BSID.Is6() && !cp.BSID.Is4In6()
+}
+
 // Valid は RFC 9256 に従い CP の妥当性を返す。
-// valid な SID-list を 1 本以上持ち、かつ BSID が SRv6(IPv6) であれば valid。
-//
-// BSID 必須は RFC 9256(§6.2.1 では BSID 無し CP も動的割当で instantiate 可)からの
-// 意図的な逸脱で、VPP が BSID を SR Policy のキーにするための
-// Specified-BSID-only(§6.2.3)相当の動作。
+// valid な SID-list を 1 本以上持てば valid。BSID は無くてもよく(§6.2.1 の動的割当対象)、
+// 割当可否(プール設定の有無)は headend 側 = Reconciler が判定する。ただし
+//   - BSID が指定されているのに SRv6(IPv6) でない → invalid
+//   - S-Flag(Specified-BSID-only, §6.2.3)付きで BSID 未指定 → invalid
 func (cp CandidatePath) Valid() bool {
-	if !cp.BSID.Is6() || cp.BSID.Is4In6() {
+	if cp.BSID.IsValid() && (!cp.BSID.Is6() || cp.BSID.Is4In6()) {
+		return false
+	}
+	if !cp.HasBSID() && cp.SpecifiedBSIDOnly {
 		return false
 	}
 	for _, sl := range cp.SegmentLists {

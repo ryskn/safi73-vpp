@@ -20,6 +20,13 @@ type fakeProgrammer struct {
 
 	preinstalled []netip.Addr // InstalledBSIDs が返す既存 BSID
 	gcRemoved    []netip.Addr // RemoveBSID で消されたもの
+
+	unreachable map[netip.Addr]bool // SIDReachable が false を返す SID
+	resolveErr  error               // SIDReachable が返すエラー
+
+	dropInstalled []srpolicy.PolicyKey // InstallDrop された policy
+	dropRemoved   []srpolicy.PolicyKey // RemoveDrop された policy
+	failDrop      bool
 }
 
 func (f *fakeProgrammer) Add(_ srpolicy.PolicyKey, cp srpolicy.CandidatePath) error {
@@ -49,6 +56,26 @@ func (f *fakeProgrammer) Remove(_ srpolicy.PolicyKey, cp srpolicy.CandidatePath)
 func (f *fakeProgrammer) InstalledBSIDs() ([]netip.Addr, error) { return f.preinstalled, nil }
 func (f *fakeProgrammer) RemoveBSID(b netip.Addr) error {
 	f.gcRemoved = append(f.gcRemoved, b)
+	return nil
+}
+
+func (f *fakeProgrammer) SIDReachable(sid netip.Addr) (bool, error) {
+	if f.resolveErr != nil {
+		return false, f.resolveErr
+	}
+	return !f.unreachable[sid], nil
+}
+
+func (f *fakeProgrammer) InstallDrop(key srpolicy.PolicyKey) error {
+	if f.failDrop {
+		return fmt.Errorf("drop failed")
+	}
+	f.dropInstalled = append(f.dropInstalled, key)
+	return nil
+}
+
+func (f *fakeProgrammer) RemoveDrop(key srpolicy.PolicyKey) error {
+	f.dropRemoved = append(f.dropRemoved, key)
 	return nil
 }
 
@@ -252,6 +279,242 @@ func TestOrphanGC(t *testing.T) {
 	}
 	if len(fp.gcRemoved) != 1 || fp.gcRemoved[0] != mustAddr("2001:db8:b::99") {
 		t.Fatalf("gcRemoved=%v, want [2001:db8:b::99]", fp.gcRemoved)
+	}
+}
+
+// BSID 無し CP: プール設定時は動的割当され、active CP が替わっても BSID は維持される
+// (RFC 9256 §6.2.1)。プール無しでは候補外。
+func TestDynamicBSIDAllocation(t *testing.T) {
+	pool := netip.MustParsePrefix("2001:db8:dddd::/64")
+	noBSID := func(disc, pref uint32) srpolicy.Event {
+		ev := cpEvent(disc, pref, "2001:db8:b::1", false)
+		ev.Path.BSID = netip.Addr{}
+		return ev
+	}
+
+	// プール無し → 候補外
+	if fp := run(t, []srpolicy.Event{noBSID(1, 100)}); len(fp.added) != 0 {
+		t.Fatalf("added=%d, want 0 without pool", len(fp.added))
+	}
+
+	// プール有り → 割当されて install、CP 切替でも同じ BSID
+	fp := run(t, []srpolicy.Event{noBSID(1, 100), noBSID(2, 200)}, WithBSIDPool(pool))
+	if len(fp.added) != 1 {
+		t.Fatalf("added=%d, want 1", len(fp.added))
+	}
+	got := fp.added[0].BSID
+	if !pool.Contains(got) {
+		t.Fatalf("allocated bsid=%s not in pool %s", got, pool)
+	}
+	if len(fp.replaced) != 1 || fp.replaced[0][1].BSID != got {
+		t.Fatalf("dynamic BSID must be stable across CP switch: %+v", fp.replaced)
+	}
+}
+
+// S-Flag (Specified-BSID-only) 付きで BSID 未指定の CP は、プールがあっても invalid。
+func TestSpecifiedBSIDOnlyWithoutBSID(t *testing.T) {
+	ev := cpEvent(1, 100, "2001:db8:b::1", false)
+	ev.Path.BSID = netip.Addr{}
+	ev.Path.SpecifiedBSIDOnly = true
+	fp := run(t, []srpolicy.Event{ev}, WithBSIDPool(netip.MustParsePrefix("2001:db8:dddd::/64")))
+	if len(fp.added) != 0 {
+		t.Fatalf("added=%d, want 0 (S-Flag forbids dynamic allocation)", len(fp.added))
+	}
+}
+
+// 動的 BSID は policy 消滅で解放され、次の policy が再利用できる。
+func TestDynamicBSIDReleasedOnPolicyDelete(t *testing.T) {
+	pool := netip.MustParsePrefix("2001:db8:dddd::/126") // host 2bit = 3 個しか無い極小プール
+	noBSID := func(withdraw bool) srpolicy.Event {
+		ev := cpEvent(1, 100, "2001:db8:b::1", withdraw)
+		ev.Path.BSID = netip.Addr{}
+		return ev
+	}
+	fp := &fakeProgrammer{}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{noBSID(false), noBSID(true)}}, fp, nil, WithBSIDPool(pool))
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.dynUsed) != 0 {
+		t.Fatalf("dynUsed=%v, want released after policy delete", r.dynUsed)
+	}
+}
+
+// SID 到達性検証 (RFC 9256 §5.1): first SID が FIB で解決できない SID-list は invalid。
+func TestSIDVerification(t *testing.T) {
+	sid := mustAddr("2001:db8:c::1")
+
+	// first SID 到達不能 → CP invalid → install されない
+	fp := &fakeProgrammer{unreachable: map[netip.Addr]bool{sid: true}}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{cpEvent(1, 100, "2001:db8:b::1", false)}},
+		fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 0 {
+		t.Fatalf("added=%d, want 0 (unreachable first SID)", len(fp.added))
+	}
+
+	// 到達可能なら install される
+	fp = &fakeProgrammer{}
+	r = NewReconciler(sliceSource{[]srpolicy.Event{cpEvent(1, 100, "2001:db8:b::1", false)}},
+		fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 1 {
+		t.Fatalf("added=%d, want 1 (reachable)", len(fp.added))
+	}
+}
+
+// V-Flag 付きの非 first SID も検証対象。V-Flag 無しの非 first SID は検証しない。
+func TestSIDVerificationVFlag(t *testing.T) {
+	second := mustAddr("2001:db8:c::2")
+	ev := cpEvent(1, 100, "2001:db8:b::1", false)
+	ev.Path.SegmentLists = []srpolicy.SegmentList{{
+		Weight: 1,
+		SIDs:   []netip.Addr{mustAddr("2001:db8:c::1"), second},
+	}}
+
+	// V-Flag 無し: 2 番目が到達不能でも install される
+	fp := &fakeProgrammer{unreachable: map[netip.Addr]bool{second: true}}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{ev}}, fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 1 {
+		t.Fatalf("added=%d, want 1 (no V-Flag on second SID)", len(fp.added))
+	}
+
+	// V-Flag 有り: 2 番目の到達不能で invalid
+	ev.Path.SegmentLists[0].VerifyMask = 1 << 1
+	fp = &fakeProgrammer{unreachable: map[netip.Addr]bool{second: true}}
+	r = NewReconciler(sliceSource{[]srpolicy.Event{ev}}, fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 0 {
+		t.Fatalf("added=%d, want 0 (V-Flag SID unreachable)", len(fp.added))
+	}
+}
+
+// 到達性の照会自体が失敗したら fail-open (install する)。
+func TestSIDVerificationFailOpen(t *testing.T) {
+	fp := &fakeProgrammer{resolveErr: fmt.Errorf("vpp down")}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{cpEvent(1, 100, "2001:db8:b::1", false)}},
+		fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 1 {
+		t.Fatalf("added=%d, want 1 (fail-open on lookup error)", len(fp.added))
+	}
+}
+
+// drop-upon-invalid (I-Flag, RFC 9256 §8.2):
+// invalid 化 → 削除 + drop 投入 / 復帰 → drop 解除 + 再投入 / 全 withdraw → drop 撤去。
+func TestDropUponInvalid(t *testing.T) {
+	valid := cpEvent(1, 100, "2001:db8:b::1", false)
+	valid.Path.DropUponInvalid = true
+	invalid := cpEvent(1, 100, "2001:db8:b::1", false)
+	invalid.Path.DropUponInvalid = true
+	invalid.Path.SegmentLists = []srpolicy.SegmentList{{Weight: 0, SIDs: []netip.Addr{mustAddr("2001:db8:c::1")}}}
+
+	// valid → invalid: policy 削除 + drop 発動
+	fp := run(t, []srpolicy.Event{valid, invalid})
+	if len(fp.removed) != 1 || len(fp.dropInstalled) != 1 || fp.dropInstalled[0] != polKey {
+		t.Fatalf("removed=%d dropInstalled=%v, want removal + drop engaged", len(fp.removed), fp.dropInstalled)
+	}
+
+	// invalid → valid: drop 解除してから再投入
+	fp = run(t, []srpolicy.Event{valid, invalid, valid})
+	if len(fp.dropRemoved) != 1 || len(fp.added) != 2 {
+		t.Fatalf("dropRemoved=%d added=%d, want drop released then reinstalled", len(fp.dropRemoved), len(fp.added))
+	}
+
+	// 全 withdraw: policy 消滅 → drop も撤去される (fail-closed の根拠が無くなる)
+	wd := cpEvent(1, 100, "2001:db8:b::1", true)
+	fp = run(t, []srpolicy.Event{valid, invalid, wd})
+	if len(fp.dropRemoved) != 1 {
+		t.Fatalf("dropRemoved=%d, want drop removed when policy ceases to exist", len(fp.dropRemoved))
+	}
+}
+
+// I-Flag 無しの CP は従来どおり削除のみ (IGP フォールバック)。
+func TestNoDropWithoutIFlag(t *testing.T) {
+	fp := run(t, []srpolicy.Event{
+		cpEvent(1, 100, "2001:db8:b::1", false),
+		cpEvent(1, 100, "2001:db8:b::1", true),
+	})
+	if len(fp.dropInstalled) != 0 {
+		t.Fatalf("dropInstalled=%v, want none without I-Flag", fp.dropInstalled)
+	}
+}
+
+// drop 投入に失敗したら既定動作 (削除のみ) にフォールバックし、状態は down のまま。
+func TestDropFailureFallsBackToRemoval(t *testing.T) {
+	valid := cpEvent(1, 100, "2001:db8:b::1", false)
+	valid.Path.DropUponInvalid = true
+	fp := &fakeProgrammer{failDrop: true}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{
+		valid,
+		cpEvent(1, 100, "2001:db8:b::1", true),
+	}}, fp, nil)
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.removed) != 1 || len(fp.dropInstalled) != 0 {
+		t.Fatalf("removed=%d dropInstalled=%d, want removal only", len(fp.removed), len(fp.dropInstalled))
+	}
+}
+
+// 再検証は priority 順 (低い値 = 高優先, RFC 9256 §2.12)。
+// FIB 変化 (SID 到達性) を再検証で拾い、priority の低い policy から処理される。
+func TestRevalidationInPriorityOrder(t *testing.T) {
+	sidHi := mustAddr("2001:db8:c::1") // 高優先 policy (priority 10) の first SID
+	sidLo := mustAddr("2001:db8:c::2") // 低優先 policy (priority 200) の first SID
+
+	evHi := cpEvent(1, 100, "2001:db8:b::1", false)
+	evHi.Path.Priority = 10
+	evHi.Path.SegmentLists = []srpolicy.SegmentList{{Weight: 1, SIDs: []netip.Addr{sidHi}}}
+	evLo := srpolicy.Event{
+		Key:  srpolicy.PolicyKey{Color: 200, Endpoint: mustAddr("2001:db8::2")},
+		Path: evHi.Path,
+	}
+	evLo.Path.Priority = 200
+	evLo.Path.SegmentLists = []srpolicy.SegmentList{{Weight: 1, SIDs: []netip.Addr{sidLo}}}
+	evLo.Path.BSID = mustAddr("2001:db8:b::2")
+
+	fp := &fakeProgrammer{unreachable: map[netip.Addr]bool{}}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{evHi, evLo}}, fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 2 {
+		t.Fatalf("added=%d, want both installed first", len(fp.added))
+	}
+
+	// FIB から両方の first SID が消えた → 再検証で両 policy down。
+	// 撤去は priority 10 の policy (b::1) が先でなければならない。
+	fp.unreachable[sidHi] = true
+	fp.unreachable[sidLo] = true
+	r.revalidateAll()
+	if len(fp.removed) != 2 {
+		t.Fatalf("removed=%d, want 2 after revalidation", len(fp.removed))
+	}
+	if fp.removed[0].BSID != mustAddr("2001:db8:b::1") {
+		t.Fatalf("first removed=%s, want priority-10 policy (b::1) first", fp.removed[0].BSID)
+	}
+
+	// FIB 復旧 → 再検証で再インストール (同じく priority 順)
+	delete(fp.unreachable, sidHi)
+	delete(fp.unreachable, sidLo)
+	r.revalidateAll()
+	if len(fp.added) != 4 {
+		t.Fatalf("added=%d, want reinstalled on recovery", len(fp.added))
+	}
+	if fp.added[2].BSID != mustAddr("2001:db8:b::1") {
+		t.Fatalf("first reinstalled=%s, want priority-10 policy first", fp.added[2].BSID)
 	}
 }
 

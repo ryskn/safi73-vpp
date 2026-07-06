@@ -22,12 +22,13 @@ func main() {
 	dist := flag.Uint("distinguisher", 1, "candidate path distinguisher")
 	endpoint := flag.String("endpoint", "2001:db8::1", "SR Policy endpoint (IPv6)")
 	nexthop := flag.String("nexthop", "2001:db8::1", "next-hop (IPv6)")
-	bsid := flag.String("bsid", "2001:db8:b::1", "Binding SID (IPv6)")
+	bsid := flag.String("bsid", "2001:db8:b::1", "Binding SID (IPv6)。空文字で BSID sub-TLV を省略 (headend の動的割当を試す用)")
 	segs := flag.String("segments", "2001:db8:cafe::1,2001:db8:cafe::2", "SID-list。';' で複数 SID-list (weighted ECMP) を区切る")
 	weights := flag.String("weights", "", "各 SID-list の weight (カンマ区切り 例 1,3)。省略時は全て 1")
 	pref := flag.Uint("preference", 100, "SR Policy preference")
-	prio := flag.Uint("priority", 0, "SR Policy priority")
+	prio := flag.Uint("priority", 128, "SR Policy priority (低い値ほど再検証が先, 既定 128 = RFC 9256 §2.12)")
 	rt := flag.String("rt", "", "Route Target (対象 headend の BGP router-id, カンマ区切り可)。省略時は NO_ADVERTISE を付ける (RFC 9830 §4.1)")
+	dropInvalid := flag.Bool("drop-upon-invalid", false, "BSID sub-TLV に I-Flag を立てる (invalid 時に drop, RFC 9256 §8.2)")
 	withdraw := flag.Bool("withdraw", false, "withdraw instead of add")
 	flag.Parse()
 
@@ -53,13 +54,17 @@ func main() {
 		{Tlv: &api.TunnelEncapTLV_TLV_SrPriority{
 			SrPriority: &api.TunnelEncapSubTLVSRPriority{Priority: uint32(*prio)},
 		}},
-		{Tlv: &api.TunnelEncapTLV_TLV_SrBindingSid{
-			SrBindingSid: &api.TunnelEncapSubTLVSRBindingSID{
-				Bsid: &api.TunnelEncapSubTLVSRBindingSID_SrBindingSid{
-					SrBindingSid: &api.SRBindingSID{Sid: net.ParseIP(*bsid).To16()},
+	}
+	if *bsid != "" {
+		subTLVs = append(subTLVs, &api.TunnelEncapTLV_TLV{
+			Tlv: &api.TunnelEncapTLV_TLV_SrBindingSid{
+				SrBindingSid: &api.TunnelEncapSubTLVSRBindingSID{
+					Bsid: &api.TunnelEncapSubTLVSRBindingSID_SrBindingSid{
+						SrBindingSid: &api.SRBindingSID{Sid: net.ParseIP(*bsid).To16(), IFlag: *dropInvalid},
+					},
 				},
 			},
-		}},
+		})
 	}
 	for i, group := range strings.Split(*segs, ";") {
 		var segList []*api.TunnelEncapSubTLVSRSegmentList_Segment

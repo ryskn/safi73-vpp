@@ -56,6 +56,7 @@ func decodePath(p *api.Path, localID netip.Addr) (ev srpolicy.Event, ok bool, no
 		Originator:    srpolicy.Originator{ASN: p.GetSourceAsn(), Node: originatorNode(p, attrs)},
 		Discriminator: nlri.GetDistinguisher(),
 		Preference:    srpolicy.DefaultPreference, // sub-TLV 不在時の既定 (RFC 9256 §2.7)
+		Priority:      srpolicy.DefaultPriority,   // 同 §2.12 (低い値ほど高優先)
 	}
 	if attrs.tunnelEncap != nil {
 		decodeTunnelEncap(attrs.tunnelEncap, &cp)
@@ -220,6 +221,7 @@ func parseSRv6BSID(v []byte) (sid netip.Addr, sFlag, iFlag, ok bool) {
 // それ以外の segment type を含む list は Unsupported を立てて invalid にする
 // (RFC 9256 §5.1: SR-MPLS/SRv6 混在 list は invalid。部分的に使ってはいけない)。
 // weight 既定 1(RFC 9256 §2.2)、明示 0 は invalid のまま保持(§5.1)。
+// V-Flag 付き segment は VerifyMask に記録する(RFC 9830 §2.4.4.2.3)。
 func decodeSegmentList(in *api.TunnelEncapSubTLVSRSegmentList) srpolicy.SegmentList {
 	out := srpolicy.SegmentList{Weight: 1}
 	if w := in.GetWeight(); w != nil {
@@ -232,6 +234,9 @@ func decodeSegmentList(in *api.TunnelEncapSubTLVSRSegmentList) srpolicy.SegmentL
 			continue
 		}
 		if a, ok := netip.AddrFromSlice(b.GetSid()); ok {
+			if b.GetFlags().GetVFlag() && len(out.SIDs) < 32 {
+				out.VerifyMask |= 1 << uint(len(out.SIDs))
+			}
 			out.SIDs = append(out.SIDs, a)
 		}
 	}

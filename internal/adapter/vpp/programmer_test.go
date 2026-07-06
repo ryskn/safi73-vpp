@@ -8,6 +8,8 @@ import (
 
 	govppapi "go.fd.io/govpp/api"
 
+	"github.com/ryskn/safi73-vpp/binapi/fib_types"
+	ipbin "github.com/ryskn/safi73-vpp/binapi/ip"
 	"github.com/ryskn/safi73-vpp/binapi/sr"
 	"github.com/ryskn/safi73-vpp/internal/srpolicy"
 )
@@ -15,9 +17,10 @@ import (
 // fakeChannel は govppapi.Channel の検証用 fake。送信メッセージを記録し、
 // メッセージ名ごとに設定された retval / dump 応答を返す。
 type fakeChannel struct {
-	sent    []govppapi.Message
-	retvals map[string][]int32            // メッセージ名 -> 返す retval 列(先頭から消費、尽きたら 0)
-	dumps   map[string][]govppapi.Message // multi-request 応答
+	sent        []govppapi.Message
+	retvals     map[string][]int32            // メッセージ名 -> 返す retval 列(先頭から消費、尽きたら 0)
+	dumps       map[string][]govppapi.Message // multi-request 応答
+	lookupReply *ipbin.IPRouteLookupReply     // ip_route_lookup の応答
 }
 
 func newFakeChannel() *fakeChannel {
@@ -52,6 +55,12 @@ func (c fakeReqCtx) ReceiveReply(msg govppapi.Message) error {
 	case *sr.SrPolicyDelReply:
 		m.Retval = rv
 	case *sr.SrSteeringAddDelReply:
+		m.Retval = rv
+	case *ipbin.IPRouteLookupReply:
+		if c.ch.lookupReply != nil {
+			*m = *c.ch.lookupReply
+		}
+	case *ipbin.IPRouteAddDelReply:
 		m.Retval = rv
 	default:
 		return fmt.Errorf("fake: unexpected reply type %T", msg)
@@ -274,6 +283,68 @@ func TestSidListRejectsOversize(t *testing.T) {
 	}
 	if _, err := sidList(sl); err == nil {
 		t.Fatal("want error for oversized segment list")
+	}
+}
+
+// InstallDrop は steering を消して drop 経路を入れ、RemoveDrop はそれを撤去する。
+func TestInstallAndRemoveDrop(t *testing.T) {
+	ch := newFakeChannel()
+	p := NewProgrammer(ch, Options{Encap: true, SteerEndpoint: true}, nil)
+
+	if err := p.InstallDrop(testKey); err != nil {
+		t.Fatal(err)
+	}
+	got := ch.sentNames()
+	if len(got) != 2 || got[0] != "sr_steering_add_del" || got[1] != "ip_route_add_del" {
+		t.Fatalf("sent=%v", got)
+	}
+	route := ch.sent[1].(*ipbin.IPRouteAddDel)
+	if !route.IsAdd || route.Route.Prefix.Len != 128 ||
+		route.Route.Paths[0].Type != fib_types.FIB_API_PATH_TYPE_DROP {
+		t.Fatalf("drop route=%+v", route)
+	}
+
+	if err := p.RemoveDrop(testKey); err != nil {
+		t.Fatal(err)
+	}
+	del := ch.sent[len(ch.sent)-1].(*ipbin.IPRouteAddDel)
+	if del.IsAdd {
+		t.Fatalf("remove drop must send IsAdd=false: %+v", del)
+	}
+
+	// steering 無効構成では drop-steer 不可
+	p = NewProgrammer(newFakeChannel(), Options{Encap: true}, nil)
+	if err := p.InstallDrop(testKey); err == nil {
+		t.Fatal("want error when steering is disabled")
+	}
+}
+
+// SIDReachable: drop 系 path しか無い route (::/0 の既定 drop 等) は到達不能扱い。
+func TestSIDReachable(t *testing.T) {
+	ch := newFakeChannel()
+	p := NewProgrammer(ch, Options{}, nil)
+
+	// drop only → false
+	ch.lookupReply = &ipbin.IPRouteLookupReply{
+		Route: ipbin.IPRoute{Paths: []fib_types.FibPath{{Type: fib_types.FIB_API_PATH_TYPE_DROP}}},
+	}
+	ok, err := p.SIDReachable(addr("2001:db8:c::1"))
+	if err != nil || ok {
+		t.Fatalf("drop-only route: ok=%v err=%v, want unreachable", ok, err)
+	}
+
+	// normal path → true
+	ch.lookupReply = &ipbin.IPRouteLookupReply{
+		Route: ipbin.IPRoute{Paths: []fib_types.FibPath{{Type: fib_types.FIB_API_PATH_TYPE_NORMAL}}},
+	}
+	if ok, err = p.SIDReachable(addr("2001:db8:c::1")); err != nil || !ok {
+		t.Fatalf("normal route: ok=%v err=%v, want reachable", ok, err)
+	}
+
+	// retval != 0 (route 無し) → false
+	ch.lookupReply = &ipbin.IPRouteLookupReply{Retval: -5}
+	if ok, err = p.SIDReachable(addr("2001:db8:c::1")); err != nil || ok {
+		t.Fatalf("no route: ok=%v err=%v, want unreachable", ok, err)
 	}
 }
 
