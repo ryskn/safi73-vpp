@@ -18,10 +18,26 @@ gobgpd ──gRPC WatchEvent──▶ safi73-vppd ──govpp──▶ VPP /run/
                                  └ steer   : endpoint/128(/32) → policy の L3 steering (任意, 既定 on)
 ```
 
-## 設計 (SOLID)
+## 設計
 
-レイヤを「ドメイン / 制御 / adapter」に分け、依存はすべて内側(ドメイン)へ向かう。
-`Reconciler` は gobgp/VPP の具象を知らず、抽象だけに依存する (依存性逆転)。
+RFC 9256 のロジック(candidate path の識別・妥当性・選択)と、gobgp / VPP という
+「たまたま今使っているソフトウェア」の事情を混ぜないことを最優先にしている。
+SR Policy の意味論は protocol/dataplane 実装が変わっても変わらないので、
+それだけを `internal/srpolicy` に純関数として置き、gobgp の API 形式や VPP の
+retval といった具象は adapter に閉じ込める。真ん中の `Reconciler` は
+「CP 集合から active を選び、dataplane との差分を埋める」ことだけを知っていて、
+相手が gobgp なのか固定イベント列なのか、VPP なのか記録用の fake なのかを知らない。
+
+こうしておく理由は主にテスト。BGP と VPP を跨ぐ結合は実機での再現・デバッグが
+高くつくので、選択ロジックはドメイン単体で、reconcile の状態遷移(failover・
+再同期・BSID 競合)は fake の Source/Programmer で、VPP への API 呼び出し順
+(make-before-break や -12 リカバリ)は fake channel で、それぞれ VPP・gobgpd
+無しで検証できるようにしてある。
+
+境界のインターフェース(`Source` / `Programmer` / `PolicyTransform`)は利用側の
+`control` が「必要とする最小の形」で定義し、adapter 側は control を import せず
+暗黙的に満たす。uSID 圧縮のような投入前変換は `PolicyTransform` の差し込みで
+追加していて、Reconciler 本体には手を入れない。
 
 ```
   レイヤと依存方向 (上 → 下へ依存)
@@ -40,7 +56,7 @@ gobgpd ──gRPC WatchEvent──▶ safi73-vppd ──govpp──▶ VPP /run/
     control.Source          ←─  adapter/bgp.Source       gobgpd gRPC WatchEvent を購読 + RFC 9830 受信規則
     control.Programmer      ←─  adapter/vpp.Programmer    sr_policy_add/mod/del + steering (make-before-break / in-place 差分)
     control.Resyncer        ←─  adapter/vpp.Programmer    起動時再同期 (dump / orphan 削除)
-    control.PolicyTransform ←─  usid.Compactor            uSID を carrier に圧縮 (任意/OCP)
+    control.PolicyTransform ←─  usid.Compactor            uSID を carrier に圧縮 (任意)
 
 
   データの流れ (runtime)
