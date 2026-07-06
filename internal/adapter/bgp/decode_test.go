@@ -169,6 +169,16 @@ func TestSRv6BSIDPreferredOverLegacy(t *testing.T) {
 	}
 }
 
+// V-Flag 付き segment は VerifyMask に記録される。
+func TestVFlagSetsVerifyMask(t *testing.T) {
+	sl := segListTLV(nil, "2001:db8:c::1", "2001:db8:c::2")
+	sl.GetSrSegmentList().Segments[1].GetB().Flags = &api.SegmentFlags{VFlag: true}
+	ev := decodeOK(t, srPath([]*api.TunnelEncapTLV_TLV{bsid13TLV("2001:db8:b::1"), sl}, noAdvComm()))
+	if got := ev.Path.SegmentLists[0].VerifyMask; got != 1<<1 {
+		t.Fatalf("verify mask=%b, want bit1 (second SID)", got)
+	}
+}
+
 // SR-MPLS(Type A)を含む list は Unsupported → invalid (RFC 9256 §5.1 混在禁止)。
 func TestMixedSegmentTypesInvalid(t *testing.T) {
 	mixed := segListTLV(nil, "2001:db8:c::1")

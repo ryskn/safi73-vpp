@@ -8,6 +8,8 @@ import (
 
 	govppapi "go.fd.io/govpp/api"
 
+	"github.com/ryskn/safi73-vpp/binapi/fib_types"
+	ipbin "github.com/ryskn/safi73-vpp/binapi/ip"
 	"github.com/ryskn/safi73-vpp/binapi/sr"
 	"github.com/ryskn/safi73-vpp/internal/srpolicy"
 )
@@ -15,9 +17,10 @@ import (
 // fakeChannel は govppapi.Channel の検証用 fake。送信メッセージを記録し、
 // メッセージ名ごとに設定された retval / dump 応答を返す。
 type fakeChannel struct {
-	sent    []govppapi.Message
-	retvals map[string][]int32            // メッセージ名 -> 返す retval 列(先頭から消費、尽きたら 0)
-	dumps   map[string][]govppapi.Message // multi-request 応答
+	sent        []govppapi.Message
+	retvals     map[string][]int32            // メッセージ名 -> 返す retval 列(先頭から消費、尽きたら 0)
+	dumps       map[string][]govppapi.Message // multi-request 応答
+	lookupReply *ipbin.IPRouteLookupReply     // ip_route_lookup の応答
 }
 
 func newFakeChannel() *fakeChannel {
@@ -53,6 +56,10 @@ func (c fakeReqCtx) ReceiveReply(msg govppapi.Message) error {
 		m.Retval = rv
 	case *sr.SrSteeringAddDelReply:
 		m.Retval = rv
+	case *ipbin.IPRouteLookupReply:
+		if c.ch.lookupReply != nil {
+			*m = *c.ch.lookupReply
+		}
 	default:
 		return fmt.Errorf("fake: unexpected reply type %T", msg)
 	}
@@ -274,6 +281,35 @@ func TestSidListRejectsOversize(t *testing.T) {
 	}
 	if _, err := sidList(sl); err == nil {
 		t.Fatal("want error for oversized segment list")
+	}
+}
+
+// SIDReachable: drop 系 path しか無い route (::/0 の既定 drop 等) は到達不能扱い。
+func TestSIDReachable(t *testing.T) {
+	ch := newFakeChannel()
+	p := NewProgrammer(ch, Options{}, nil)
+
+	// drop only → false
+	ch.lookupReply = &ipbin.IPRouteLookupReply{
+		Route: ipbin.IPRoute{Paths: []fib_types.FibPath{{Type: fib_types.FIB_API_PATH_TYPE_DROP}}},
+	}
+	ok, err := p.SIDReachable(addr("2001:db8:c::1"))
+	if err != nil || ok {
+		t.Fatalf("drop-only route: ok=%v err=%v, want unreachable", ok, err)
+	}
+
+	// normal path → true
+	ch.lookupReply = &ipbin.IPRouteLookupReply{
+		Route: ipbin.IPRoute{Paths: []fib_types.FibPath{{Type: fib_types.FIB_API_PATH_TYPE_NORMAL}}},
+	}
+	if ok, err = p.SIDReachable(addr("2001:db8:c::1")); err != nil || !ok {
+		t.Fatalf("normal route: ok=%v err=%v, want reachable", ok, err)
+	}
+
+	// retval != 0 (route 無し) → false
+	ch.lookupReply = &ipbin.IPRouteLookupReply{Retval: -5}
+	if ok, err = p.SIDReachable(addr("2001:db8:c::1")); err != nil || ok {
+		t.Fatalf("no route: ok=%v err=%v, want unreachable", ok, err)
 	}
 }
 

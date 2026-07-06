@@ -3,6 +3,8 @@ package usid
 import (
 	"net/netip"
 	"testing"
+
+	"github.com/ryskn/safi73-vpp/internal/srpolicy"
 )
 
 func addrs(ss ...string) []netip.Addr {
@@ -79,6 +81,23 @@ func TestCompactPassesThroughNonSingleUSID(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got[%d]=%s want %s", i, got[i], want[i])
 		}
+	}
+}
+
+func TestCompactorCarriesVerifyMask(t *testing.T) {
+	// 圧縮で SID と mask bit の対応が崩れるため、verification 要求は
+	// 先頭 SID (carrier) への要求として引き継がれる
+	c := Compactor{Block: block()}
+	in := srpolicy.CandidatePath{SegmentLists: []srpolicy.SegmentList{
+		{Weight: 1, SIDs: addrs("fcbb:bb00:1::", "fcbb:bb00:2::"), VerifyMask: 1 << 1},
+		{Weight: 1, SIDs: addrs("fcbb:bb00:3::")}, // 要求なし
+	}}
+	out := c.Apply(in)
+	if out.SegmentLists[0].VerifyMask != 1 {
+		t.Fatalf("mask=%b, want 1 (verify carrier head)", out.SegmentLists[0].VerifyMask)
+	}
+	if out.SegmentLists[1].VerifyMask != 0 {
+		t.Fatalf("mask=%b, want 0", out.SegmentLists[1].VerifyMask)
 	}
 }
 

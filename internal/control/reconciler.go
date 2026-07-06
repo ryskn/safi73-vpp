@@ -43,12 +43,14 @@ type policyState struct {
 // headend が実際に instantiate する SID-list を変えるため、RFC 9256 §5.1 の妥当性
 // (SID 数上限を含む)は変換後の姿で評価しなければならない。
 type Reconciler struct {
-	source    Source
-	prog      Programmer
-	transform PolicyTransform
-	log       *slog.Logger
-	orphanGC  bool
-	pool      *bsidPool
+	source     Source
+	prog       Programmer
+	transform  PolicyTransform
+	log        *slog.Logger
+	orphanGC   bool
+	pool       *bsidPool
+	verifySIDs bool
+	resolver   SIDResolver // verifySIDs 有効時のみ非 nil (Run で解決)
 
 	mu       sync.Mutex
 	policies map[srpolicy.PolicyKey]*policyState
@@ -90,6 +92,14 @@ func WithBSIDPool(prefix netip.Prefix) Option {
 	return func(r *Reconciler) { r.pool = newBSIDPool(prefix) }
 }
 
+// WithSIDVerification は RFC 9256 §5.1 の SID 解決チェックを有効にする。
+// 各 SID-list の first SID と、V-Flag で verification を要求された SID を
+// dataplane の FIB で解決できなければ、その SID-list を invalid にする。
+// Programmer が SIDResolver を満たさない場合は警告して無効のまま動く。
+func WithSIDVerification() Option {
+	return func(r *Reconciler) { r.verifySIDs = true }
+}
+
 // NewReconciler は依存を注入して生成する。
 func NewReconciler(src Source, prog Programmer, log *slog.Logger, opts ...Option) *Reconciler {
 	if log == nil {
@@ -119,6 +129,14 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	r.mu.Lock()
 	r.gen++
 	r.refreshOrphans()
+	if r.verifySIDs && r.resolver == nil {
+		if res, ok := r.prog.(SIDResolver); ok {
+			r.resolver = res
+		} else {
+			r.log.Warn("SID verification requested but programmer cannot resolve SIDs; disabled")
+			r.verifySIDs = false
+		}
+	}
 	r.mu.Unlock()
 	return r.source.Subscribe(ctx, r.apply, r.synced)
 }
@@ -214,6 +232,46 @@ func (r *Reconciler) synced() {
 	}
 }
 
+// verifySegmentLists は各 SID-list の first SID と V-Flag 要求 SID を FIB で解決し、
+// 解決できない list に Unresolvable を立てたコピーを返す(RFC 9256 §5.1)。
+// 解決の照会自体に失敗した場合は fail-open(到達可能扱い + 警告)にする。
+// r.mu を保持して呼ぶこと。
+func (r *Reconciler) verifySegmentLists(key srpolicy.PolicyKey, sls []srpolicy.SegmentList, cache map[netip.Addr]bool) []srpolicy.SegmentList {
+	reachable := func(sid netip.Addr) bool {
+		if v, hit := cache[sid]; hit {
+			return v
+		}
+		ok, err := r.resolver.SIDReachable(sid)
+		if err != nil {
+			r.log.Warn("SID reachability lookup failed; assuming reachable", "sid", sid, "err", err)
+			ok = true
+		}
+		cache[sid] = ok
+		return ok
+	}
+
+	out := make([]srpolicy.SegmentList, len(sls))
+	for i, sl := range sls {
+		out[i] = sl
+		if len(sl.SIDs) == 0 {
+			continue
+		}
+		for j, sid := range sl.SIDs {
+			// first SID は常に、それ以外は V-Flag が立っている場合のみ検証(§5.1)
+			if j != 0 && (j >= 32 || sl.VerifyMask&(1<<uint(j)) == 0) {
+				continue
+			}
+			if !reachable(sid) {
+				r.log.Warn("segment list invalid: SID unresolvable in FIB (RFC 9256 §5.1)",
+					"policy", key.String(), "sid", sid, "position", j)
+				out[i].Unresolvable = true
+				break
+			}
+		}
+	}
+	return out
+}
+
 // ensureDynBSID は policy に動的 BSID を割り当てる(割当済みなら何もしない)。
 // r.mu を保持して呼ぶこと。
 func (r *Reconciler) ensureDynBSID(key srpolicy.PolicyKey, ps *policyState) bool {
@@ -253,9 +311,13 @@ func (r *Reconciler) releaseDynBSID(ps *policyState) {
 func (r *Reconciler) reconcile(key srpolicy.PolicyKey, ps *policyState) {
 	// 変換(uSID 圧縮など)を全 CP に適用してから妥当性・選択を評価する。
 	// 他 policy が所有する BSID を持つ CP は候補から除外する(RFC 9256 §6.1)。
+	reach := map[netip.Addr]bool{} // この reconcile 内での到達性 lookup キャッシュ
 	cps := make([]srpolicy.CandidatePath, 0, len(ps.cps))
 	for _, c := range ps.cps {
 		t := r.transform.Apply(c.path)
+		if r.verifySIDs {
+			t.SegmentLists = r.verifySegmentLists(key, t.SegmentLists, reach)
+		}
 		if !t.HasBSID() && !t.SpecifiedBSIDOnly {
 			if r.pool == nil {
 				r.log.Warn("candidate path has no BSID and no -bsid-pool configured; excluded",

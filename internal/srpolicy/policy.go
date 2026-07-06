@@ -29,13 +29,19 @@ type SegmentList struct {
 	// Unsupported は SRv6 以外(SR-MPLS 等)の segment type を含んでいたことを示す。
 	// RFC 9256 §5.1: SR-MPLS と SRv6 の混在 list は invalid(部分的に使うのは禁止)。
 	Unsupported bool
+	// VerifyMask は V-Flag(SID verification 要求)が立っていた SID の bit 集合
+	// (bit i = SIDs[i])。first SID は V-Flag に関係なく常に検証対象(§5.1)。
+	VerifyMask uint32
+	// Unresolvable は headend が first SID(または verification 要求 SID)を FIB で
+	// 解決できなかったことを示す(§5.1 → invalid)。到達性検証時に headend が立てる。
+	Unresolvable bool
 }
 
 // Valid は RFC 9256 §5.1 に従い SID-list の妥当性を返す。
-// 空 / weight==0 / 非 IPv6(SRv6でない) SID / 混在 segment type /
+// 空 / weight==0 / 非 IPv6(SRv6でない) SID / 混在 segment type / SID 解決不能 /
 // headend 上限(MaxSIDsPerList)超過は invalid。
 func (sl SegmentList) Valid() bool {
-	if sl.Unsupported || len(sl.SIDs) == 0 || len(sl.SIDs) > MaxSIDsPerList || sl.Weight == 0 {
+	if sl.Unsupported || sl.Unresolvable || len(sl.SIDs) == 0 || len(sl.SIDs) > MaxSIDsPerList || sl.Weight == 0 {
 		return false
 	}
 	for _, s := range sl.SIDs {

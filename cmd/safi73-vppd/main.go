@@ -36,6 +36,7 @@ func main() {
 	steer := flag.Bool("steer", true, "endpoint/128(/32) への L3 steering を policy と一緒に投入する")
 	orphanGC := flag.Bool("orphan-gc", false, "初期同期後、BGP 側に対応 CP が無い VPP 上の SR Policy を削除する (VPP を他の管理主体と共有しているなら無効のまま)")
 	bsidPool := flag.String("bsid-pool", "", "BSID 未指定の CP に動的割当する BSID プール (例 2001:db8:b::/64, RFC 9256 §6.2.1)。未指定なら BSID 無し CP は候補外")
+	verifySIDs := flag.Bool("verify-sids", false, "first SID と V-Flag 付き SID を VPP FIB で解決できない SID-list を invalid にする (RFC 9256 §5.1)")
 	usidBlock := flag.String("usid-block", "", "uSID ブロック (例 fcbb:bb00::/32)。指定すると segment list を uSID carrier に圧縮する")
 	usidLen := flag.Int("usid-len", 16, "uSID 長(ビット)")
 	flag.Parse()
@@ -96,6 +97,10 @@ func main() {
 		}
 		opts = append(opts, control.WithBSIDPool(pfx))
 		log.Info("dynamic BSID allocation enabled", "pool", pfx)
+	}
+	if *verifySIDs {
+		opts = append(opts, control.WithSIDVerification())
+		log.Info("SID reachability verification enabled (RFC 9256 §5.1)")
 	}
 	if *usidBlock != "" {
 		pfx, err := netip.ParsePrefix(*usidBlock)

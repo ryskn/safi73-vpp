@@ -7,6 +7,8 @@ import (
 
 	govppapi "go.fd.io/govpp/api"
 
+	"github.com/ryskn/safi73-vpp/binapi/fib_types"
+	"github.com/ryskn/safi73-vpp/binapi/ip"
 	"github.com/ryskn/safi73-vpp/binapi/ip_types"
 	"github.com/ryskn/safi73-vpp/binapi/sr"
 	sr_types "github.com/ryskn/safi73-vpp/binapi/sr_types"
@@ -124,6 +126,34 @@ func (p *Programmer) InstalledBSIDs() ([]netip.Addr, error) {
 // RemoveBSID は BSID 指定で SR Policy を削除する(orphan GC 用)。
 func (p *Programmer) RemoveBSID(bsid netip.Addr) error {
 	return p.deletePolicy(toIP6(bsid))
+}
+
+// SIDReachable は SID を FIB (opts.FIBTable, encap 後の lookup と同じテーブル) で
+// LPM 解決し、drop 以外の path に解決できるかを返す(RFC 9256 §5.1 の SID 解決)。
+// IPv6 FIB は ::/0 が既定 drop なので「route が引けた」だけでは到達可能とみなさない。
+func (p *Programmer) SIDReachable(sid netip.Addr) (bool, error) {
+	req := &ip.IPRouteLookup{TableID: p.opts.FIBTable}
+	req.Prefix.Address.Af = ip_types.ADDRESS_IP6
+	req.Prefix.Address.Un.SetIP6(toIP6(sid))
+	req.Prefix.Len = 128
+
+	reply := &ip.IPRouteLookupReply{}
+	if err := p.ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		return false, fmt.Errorf("ip_route_lookup sid=%s: %w", sid, err)
+	}
+	if reply.Retval != 0 {
+		return false, nil // 一致 route 無し
+	}
+	for _, path := range reply.Route.Paths {
+		switch path.Type {
+		case fib_types.FIB_API_PATH_TYPE_DROP,
+			fib_types.FIB_API_PATH_TYPE_ICMP_UNREACH,
+			fib_types.FIB_API_PATH_TYPE_ICMP_PROHIBIT:
+		default:
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // installPolicy は policy を新規投入する。BSID が既に居れば削除して置き換え、

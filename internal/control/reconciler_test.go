@@ -20,6 +20,9 @@ type fakeProgrammer struct {
 
 	preinstalled []netip.Addr // InstalledBSIDs が返す既存 BSID
 	gcRemoved    []netip.Addr // RemoveBSID で消されたもの
+
+	unreachable map[netip.Addr]bool // SIDReachable が false を返す SID
+	resolveErr  error               // SIDReachable が返すエラー
 }
 
 func (f *fakeProgrammer) Add(_ srpolicy.PolicyKey, cp srpolicy.CandidatePath) error {
@@ -50,6 +53,13 @@ func (f *fakeProgrammer) InstalledBSIDs() ([]netip.Addr, error) { return f.prein
 func (f *fakeProgrammer) RemoveBSID(b netip.Addr) error {
 	f.gcRemoved = append(f.gcRemoved, b)
 	return nil
+}
+
+func (f *fakeProgrammer) SIDReachable(sid netip.Addr) (bool, error) {
+	if f.resolveErr != nil {
+		return false, f.resolveErr
+	}
+	return !f.unreachable[sid], nil
 }
 
 // lastActive は「いま dataplane で active な CP」相当(最後の add/replace 結果)。
@@ -310,6 +320,77 @@ func TestDynamicBSIDReleasedOnPolicyDelete(t *testing.T) {
 	}
 	if len(r.dynUsed) != 0 {
 		t.Fatalf("dynUsed=%v, want released after policy delete", r.dynUsed)
+	}
+}
+
+// SID 到達性検証 (RFC 9256 §5.1): first SID が FIB で解決できない SID-list は invalid。
+func TestSIDVerification(t *testing.T) {
+	sid := mustAddr("2001:db8:c::1")
+
+	// first SID 到達不能 → CP invalid → install されない
+	fp := &fakeProgrammer{unreachable: map[netip.Addr]bool{sid: true}}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{cpEvent(1, 100, "2001:db8:b::1", false)}},
+		fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 0 {
+		t.Fatalf("added=%d, want 0 (unreachable first SID)", len(fp.added))
+	}
+
+	// 到達可能なら install される
+	fp = &fakeProgrammer{}
+	r = NewReconciler(sliceSource{[]srpolicy.Event{cpEvent(1, 100, "2001:db8:b::1", false)}},
+		fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 1 {
+		t.Fatalf("added=%d, want 1 (reachable)", len(fp.added))
+	}
+}
+
+// V-Flag 付きの非 first SID も検証対象。V-Flag 無しの非 first SID は検証しない。
+func TestSIDVerificationVFlag(t *testing.T) {
+	second := mustAddr("2001:db8:c::2")
+	ev := cpEvent(1, 100, "2001:db8:b::1", false)
+	ev.Path.SegmentLists = []srpolicy.SegmentList{{
+		Weight: 1,
+		SIDs:   []netip.Addr{mustAddr("2001:db8:c::1"), second},
+	}}
+
+	// V-Flag 無し: 2 番目が到達不能でも install される
+	fp := &fakeProgrammer{unreachable: map[netip.Addr]bool{second: true}}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{ev}}, fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 1 {
+		t.Fatalf("added=%d, want 1 (no V-Flag on second SID)", len(fp.added))
+	}
+
+	// V-Flag 有り: 2 番目の到達不能で invalid
+	ev.Path.SegmentLists[0].VerifyMask = 1 << 1
+	fp = &fakeProgrammer{unreachable: map[netip.Addr]bool{second: true}}
+	r = NewReconciler(sliceSource{[]srpolicy.Event{ev}}, fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 0 {
+		t.Fatalf("added=%d, want 0 (V-Flag SID unreachable)", len(fp.added))
+	}
+}
+
+// 到達性の照会自体が失敗したら fail-open (install する)。
+func TestSIDVerificationFailOpen(t *testing.T) {
+	fp := &fakeProgrammer{resolveErr: fmt.Errorf("vpp down")}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{cpEvent(1, 100, "2001:db8:b::1", false)}},
+		fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 1 {
+		t.Fatalf("added=%d, want 1 (fail-open on lookup error)", len(fp.added))
 	}
 }
 
