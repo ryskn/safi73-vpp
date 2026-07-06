@@ -35,6 +35,7 @@ func main() {
 	fibTable := flag.Uint("fib", 0, "SR Policy の FIB table 番号 (BSID の VRF 兼 encap 後の egress lookup テーブル)")
 	steer := flag.Bool("steer", true, "endpoint/128(/32) への L3 steering を policy と一緒に投入する")
 	orphanGC := flag.Bool("orphan-gc", false, "初期同期後、BGP 側に対応 CP が無い VPP 上の SR Policy を削除する (VPP を他の管理主体と共有しているなら無効のまま)")
+	bsidPool := flag.String("bsid-pool", "", "BSID 未指定の CP に動的割当する BSID プール (例 2001:db8:b::/64, RFC 9256 §6.2.1)。未指定なら BSID 無し CP は候補外")
 	usidBlock := flag.String("usid-block", "", "uSID ブロック (例 fcbb:bb00::/32)。指定すると segment list を uSID carrier に圧縮する")
 	usidLen := flag.Int("usid-len", 16, "uSID 長(ビット)")
 	flag.Parse()
@@ -86,6 +87,15 @@ func main() {
 	var opts []control.Option
 	if *orphanGC {
 		opts = append(opts, control.WithOrphanGC())
+	}
+	if *bsidPool != "" {
+		pfx, err := netip.ParsePrefix(*bsidPool)
+		if err != nil || !pfx.Addr().Is6() || pfx.Addr().Is4In6() {
+			log.Error("invalid -bsid-pool (IPv6 prefix のみ)", "value", *bsidPool, "err", err)
+			os.Exit(1)
+		}
+		opts = append(opts, control.WithBSIDPool(pfx))
+		log.Info("dynamic BSID allocation enabled", "pool", pfx)
 	}
 	if *usidBlock != "" {
 		pfx, err := netip.ParsePrefix(*usidBlock)

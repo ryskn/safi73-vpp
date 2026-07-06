@@ -255,6 +255,64 @@ func TestOrphanGC(t *testing.T) {
 	}
 }
 
+// BSID 無し CP: プール設定時は動的割当され、active CP が替わっても BSID は維持される
+// (RFC 9256 §6.2.1)。プール無しでは候補外。
+func TestDynamicBSIDAllocation(t *testing.T) {
+	pool := netip.MustParsePrefix("2001:db8:dddd::/64")
+	noBSID := func(disc, pref uint32) srpolicy.Event {
+		ev := cpEvent(disc, pref, "2001:db8:b::1", false)
+		ev.Path.BSID = netip.Addr{}
+		return ev
+	}
+
+	// プール無し → 候補外
+	if fp := run(t, []srpolicy.Event{noBSID(1, 100)}); len(fp.added) != 0 {
+		t.Fatalf("added=%d, want 0 without pool", len(fp.added))
+	}
+
+	// プール有り → 割当されて install、CP 切替でも同じ BSID
+	fp := run(t, []srpolicy.Event{noBSID(1, 100), noBSID(2, 200)}, WithBSIDPool(pool))
+	if len(fp.added) != 1 {
+		t.Fatalf("added=%d, want 1", len(fp.added))
+	}
+	got := fp.added[0].BSID
+	if !pool.Contains(got) {
+		t.Fatalf("allocated bsid=%s not in pool %s", got, pool)
+	}
+	if len(fp.replaced) != 1 || fp.replaced[0][1].BSID != got {
+		t.Fatalf("dynamic BSID must be stable across CP switch: %+v", fp.replaced)
+	}
+}
+
+// S-Flag (Specified-BSID-only) 付きで BSID 未指定の CP は、プールがあっても invalid。
+func TestSpecifiedBSIDOnlyWithoutBSID(t *testing.T) {
+	ev := cpEvent(1, 100, "2001:db8:b::1", false)
+	ev.Path.BSID = netip.Addr{}
+	ev.Path.SpecifiedBSIDOnly = true
+	fp := run(t, []srpolicy.Event{ev}, WithBSIDPool(netip.MustParsePrefix("2001:db8:dddd::/64")))
+	if len(fp.added) != 0 {
+		t.Fatalf("added=%d, want 0 (S-Flag forbids dynamic allocation)", len(fp.added))
+	}
+}
+
+// 動的 BSID は policy 消滅で解放され、次の policy が再利用できる。
+func TestDynamicBSIDReleasedOnPolicyDelete(t *testing.T) {
+	pool := netip.MustParsePrefix("2001:db8:dddd::/126") // host 2bit = 3 個しか無い極小プール
+	noBSID := func(withdraw bool) srpolicy.Event {
+		ev := cpEvent(1, 100, "2001:db8:b::1", withdraw)
+		ev.Path.BSID = netip.Addr{}
+		return ev
+	}
+	fp := &fakeProgrammer{}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{noBSID(false), noBSID(true)}}, fp, nil, WithBSIDPool(pool))
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.dynUsed) != 0 {
+		t.Fatalf("dynUsed=%v, want released after policy delete", r.dynUsed)
+	}
+}
+
 // markTransform は変換が適用されることの確認用。
 type markTransform struct{ called *int }
 

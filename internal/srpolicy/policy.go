@@ -105,7 +105,7 @@ type CandidatePath struct {
 	SegmentLists []SegmentList
 
 	// SpecifiedBSIDOnly は BSID sub-TLV の S-Flag(RFC 9256 §6.2.3)。
-	// この実装は VPP が BSID をキーとする都合で常に Specified-BSID-only 相当で動く。
+	// 立っていると BSID 未指定/割当不可のとき CP を invalid にする(動的割当を許さない)。
 	SpecifiedBSIDOnly bool
 	// DropUponInvalid は BSID sub-TLV の I-Flag(RFC 9256 §8.2)。
 	// VPP dataplane に相当機能が無いため未対応(検出してログのみ)。
@@ -117,14 +117,21 @@ func (cp CandidatePath) Key() CPKey {
 	return CPKey{cp.Origin, cp.Originator.ASN, cp.Originator.Node, cp.Discriminator}
 }
 
+// HasBSID は SRv6 として使える BSID が指定されているかを返す。
+func (cp CandidatePath) HasBSID() bool {
+	return cp.BSID.IsValid() && cp.BSID.Is6() && !cp.BSID.Is4In6()
+}
+
 // Valid は RFC 9256 に従い CP の妥当性を返す。
-// valid な SID-list を 1 本以上持ち、かつ BSID が SRv6(IPv6) であれば valid。
-//
-// BSID 必須は RFC 9256(§6.2.1 では BSID 無し CP も動的割当で instantiate 可)からの
-// 意図的な逸脱で、VPP が BSID を SR Policy のキーにするための
-// Specified-BSID-only(§6.2.3)相当の動作。
+// valid な SID-list を 1 本以上持てば valid。BSID は無くてもよく(§6.2.1 の動的割当対象)、
+// 割当可否(プール設定の有無)は headend 側 = Reconciler が判定する。ただし
+//   - BSID が指定されているのに SRv6(IPv6) でない → invalid
+//   - S-Flag(Specified-BSID-only, §6.2.3)付きで BSID 未指定 → invalid
 func (cp CandidatePath) Valid() bool {
-	if !cp.BSID.Is6() || cp.BSID.Is4In6() {
+	if cp.BSID.IsValid() && (!cp.BSID.Is6() || cp.BSID.Is4In6()) {
+		return false
+	}
+	if !cp.HasBSID() && cp.SpecifiedBSIDOnly {
 		return false
 	}
 	for _, sl := range cp.SegmentLists {

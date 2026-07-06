@@ -31,6 +31,9 @@ type policyState struct {
 	installed srpolicy.CandidatePath // dataplane に入れている active CP(変換後)
 	activeKey srpolicy.CPKey
 	hasActive bool
+	// dynBSID はこの SR Policy に動的に束縛した BSID(RFC 9256 §6.2.1)。
+	// 一度割り当てたら active CP が替わっても policy が生きている間は維持する。
+	dynBSID netip.Addr
 }
 
 // Reconciler は Source からの candidate path イベントを集約し、RFC 9256 §2.9 に従って
@@ -45,9 +48,12 @@ type Reconciler struct {
 	transform PolicyTransform
 	log       *slog.Logger
 	orphanGC  bool
+	pool      *bsidPool
 
 	mu       sync.Mutex
 	policies map[srpolicy.PolicyKey]*policyState
+	// dynUsed は動的割当済み BSID(プールの二重払い出し防止)。
+	dynUsed map[netip.Addr]srpolicy.PolicyKey
 	// bsidOwner は instantiate 済み BSID の所有 policy。RFC 9256 §6.1 の
 	// 「異なる SR Policy の CP が同じ BSID を持ってはならない」の検出に使う。
 	bsidOwner map[netip.Addr]srpolicy.PolicyKey
@@ -76,6 +82,14 @@ func WithOrphanGC() Option {
 	return func(r *Reconciler) { r.orphanGC = true }
 }
 
+// WithBSIDPool は BSID 未指定の CP への動的 BSID 割当(RFC 9256 §6.2.1)を有効にする。
+// prefix の host 部から policy ごとに 1 個払い出し、policy が消えるまで維持する。
+// 注意: 割当は daemon のメモリ上のみで、再起動すると同じ policy でも別の BSID に
+// なりうる(旧 BSID の残骸は -orphan-gc で回収)。
+func WithBSIDPool(prefix netip.Prefix) Option {
+	return func(r *Reconciler) { r.pool = newBSIDPool(prefix) }
+}
+
 // NewReconciler は依存を注入して生成する。
 func NewReconciler(src Source, prog Programmer, log *slog.Logger, opts ...Option) *Reconciler {
 	if log == nil {
@@ -89,6 +103,7 @@ func NewReconciler(src Source, prog Programmer, log *slog.Logger, opts ...Option
 		policies:  map[srpolicy.PolicyKey]*policyState{},
 		bsidOwner: map[netip.Addr]srpolicy.PolicyKey{},
 		orphans:   map[netip.Addr]struct{}{},
+		dynUsed:   map[netip.Addr]srpolicy.PolicyKey{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -152,6 +167,7 @@ func (r *Reconciler) apply(ev srpolicy.Event) {
 	r.reconcile(ev.Key, ps)
 
 	if len(ps.cps) == 0 && !ps.hasActive {
+		r.releaseDynBSID(ps)
 		delete(r.policies, ev.Key)
 	}
 }
@@ -174,6 +190,7 @@ func (r *Reconciler) synced() {
 			r.log.Info("swept stale candidate paths after resync", "policy", key.String())
 			r.reconcile(key, ps)
 			if len(ps.cps) == 0 && !ps.hasActive {
+				r.releaseDynBSID(ps)
 				delete(r.policies, key)
 			}
 		}
@@ -197,6 +214,40 @@ func (r *Reconciler) synced() {
 	}
 }
 
+// ensureDynBSID は policy に動的 BSID を割り当てる(割当済みなら何もしない)。
+// r.mu を保持して呼ぶこと。
+func (r *Reconciler) ensureDynBSID(key srpolicy.PolicyKey, ps *policyState) bool {
+	if ps.dynBSID.IsValid() {
+		return true
+	}
+	bsid, ok := r.pool.alloc(func(a netip.Addr) bool {
+		if _, used := r.bsidOwner[a]; used {
+			return true
+		}
+		if _, used := r.dynUsed[a]; used {
+			return true
+		}
+		_, used := r.orphans[a]
+		return used
+	})
+	if !ok {
+		r.log.Error("BSID pool exhausted; candidate path excluded", "policy", key.String())
+		return false
+	}
+	ps.dynBSID = bsid
+	r.dynUsed[bsid] = key
+	r.log.Info("dynamically bound BSID (RFC 9256 §6.2.1)", "policy", key.String(), "bsid", bsid)
+	return true
+}
+
+// releaseDynBSID は policy 削除時に動的 BSID をプールへ返す。r.mu を保持して呼ぶこと。
+func (r *Reconciler) releaseDynBSID(ps *policyState) {
+	if ps.dynBSID.IsValid() {
+		delete(r.dynUsed, ps.dynBSID)
+		ps.dynBSID = netip.Addr{}
+	}
+}
+
 // reconcile は active CP を選び直し、instantiate 済みとの差分を Programmer に反映する。
 // r.mu を保持して呼ぶこと。
 func (r *Reconciler) reconcile(key srpolicy.PolicyKey, ps *policyState) {
@@ -205,6 +256,17 @@ func (r *Reconciler) reconcile(key srpolicy.PolicyKey, ps *policyState) {
 	cps := make([]srpolicy.CandidatePath, 0, len(ps.cps))
 	for _, c := range ps.cps {
 		t := r.transform.Apply(c.path)
+		if !t.HasBSID() && !t.SpecifiedBSIDOnly {
+			if r.pool == nil {
+				r.log.Warn("candidate path has no BSID and no -bsid-pool configured; excluded",
+					"policy", key.String(), "discriminator", t.Discriminator)
+				continue
+			}
+			if !r.ensureDynBSID(key, ps) {
+				continue
+			}
+			t.BSID = ps.dynBSID // 動的 BSID は policy が生きている間固定 (§6.2.1)
+		}
 		if owner, taken := r.bsidOwner[t.BSID]; taken && owner != key {
 			// RFC 9256 §6.2: BSID が使用不可のときは alert を出さなければならない。
 			r.log.Error("BSID conflict: candidate path excluded",
