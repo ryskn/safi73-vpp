@@ -65,3 +65,27 @@ func TestCompactPassesThroughOutOfBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestCompactPassesThroughNonSingleUSID(t *testing.T) {
+	// block 配下でも「単一 uSID + 残り全ゼロ」でないアドレスは圧縮対象外:
+	// 既に複数 uSID が詰まった carrier のビットを黙って落としてはいけない。
+	carrier := "fcbb:bb00:10:20:30::"
+	got := block().Compact(addrs("fcbb:bb00:1::", carrier, "fcbb:bb00:2::"))
+	want := addrs("fcbb:bb00:1::", carrier, "fcbb:bb00:2::")
+	if len(got) != 3 {
+		t.Fatalf("got %v, want 3 entries (carrier must not be re-compacted)", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d]=%s want %s", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCompactPassesThroughBareBlockPrefix(t *testing.T) {
+	// uSID 部が全ゼロ(= block そのもの)のアドレスは単一 uSID ではない
+	got := block().Compact(addrs("fcbb:bb00::"))
+	if len(got) != 1 || got[0] != netip.MustParseAddr("fcbb:bb00::") {
+		t.Fatalf("got %v, want bare block prefix passthrough", got)
+	}
+}
