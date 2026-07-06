@@ -26,7 +26,7 @@ func main() {
 	segs := flag.String("segments", "2001:db8:cafe::1,2001:db8:cafe::2", "SID-list。';' で複数 SID-list (weighted ECMP) を区切る")
 	weights := flag.String("weights", "", "各 SID-list の weight (カンマ区切り 例 1,3)。省略時は全て 1")
 	pref := flag.Uint("preference", 100, "SR Policy preference")
-	prio := flag.Uint("priority", 0, "SR Policy priority")
+	prio := flag.Uint("priority", 128, "SR Policy priority (低い値ほど再検証が先, 既定 128 = RFC 9256 §2.12)")
 	rt := flag.String("rt", "", "Route Target (対象 headend の BGP router-id, カンマ区切り可)。省略時は NO_ADVERTISE を付ける (RFC 9830 §4.1)")
 	dropInvalid := flag.Bool("drop-upon-invalid", false, "BSID sub-TLV に I-Flag を立てる (invalid 時に drop, RFC 9256 §8.2)")
 	withdraw := flag.Bool("withdraw", false, "withdraw instead of add")

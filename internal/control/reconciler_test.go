@@ -468,6 +468,56 @@ func TestDropFailureFallsBackToRemoval(t *testing.T) {
 	}
 }
 
+// 再検証は priority 順 (低い値 = 高優先, RFC 9256 §2.12)。
+// FIB 変化 (SID 到達性) を再検証で拾い、priority の低い policy から処理される。
+func TestRevalidationInPriorityOrder(t *testing.T) {
+	sidHi := mustAddr("2001:db8:c::1") // 高優先 policy (priority 10) の first SID
+	sidLo := mustAddr("2001:db8:c::2") // 低優先 policy (priority 200) の first SID
+
+	evHi := cpEvent(1, 100, "2001:db8:b::1", false)
+	evHi.Path.Priority = 10
+	evHi.Path.SegmentLists = []srpolicy.SegmentList{{Weight: 1, SIDs: []netip.Addr{sidHi}}}
+	evLo := srpolicy.Event{
+		Key:  srpolicy.PolicyKey{Color: 200, Endpoint: mustAddr("2001:db8::2")},
+		Path: evHi.Path,
+	}
+	evLo.Path.Priority = 200
+	evLo.Path.SegmentLists = []srpolicy.SegmentList{{Weight: 1, SIDs: []netip.Addr{sidLo}}}
+	evLo.Path.BSID = mustAddr("2001:db8:b::2")
+
+	fp := &fakeProgrammer{unreachable: map[netip.Addr]bool{}}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{evHi, evLo}}, fp, nil, WithSIDVerification())
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.added) != 2 {
+		t.Fatalf("added=%d, want both installed first", len(fp.added))
+	}
+
+	// FIB から両方の first SID が消えた → 再検証で両 policy down。
+	// 撤去は priority 10 の policy (b::1) が先でなければならない。
+	fp.unreachable[sidHi] = true
+	fp.unreachable[sidLo] = true
+	r.revalidateAll()
+	if len(fp.removed) != 2 {
+		t.Fatalf("removed=%d, want 2 after revalidation", len(fp.removed))
+	}
+	if fp.removed[0].BSID != mustAddr("2001:db8:b::1") {
+		t.Fatalf("first removed=%s, want priority-10 policy (b::1) first", fp.removed[0].BSID)
+	}
+
+	// FIB 復旧 → 再検証で再インストール (同じく priority 順)
+	delete(fp.unreachable, sidHi)
+	delete(fp.unreachable, sidLo)
+	r.revalidateAll()
+	if len(fp.added) != 4 {
+		t.Fatalf("added=%d, want reinstalled on recovery", len(fp.added))
+	}
+	if fp.added[2].BSID != mustAddr("2001:db8:b::1") {
+		t.Fatalf("first reinstalled=%s, want priority-10 policy first", fp.added[2].BSID)
+	}
+}
+
 // markTransform は変換が適用されることの確認用。
 type markTransform struct{ called *int }
 

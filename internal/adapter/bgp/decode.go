@@ -56,6 +56,7 @@ func decodePath(p *api.Path, localID netip.Addr) (ev srpolicy.Event, ok bool, no
 		Originator:    srpolicy.Originator{ASN: p.GetSourceAsn(), Node: originatorNode(p, attrs)},
 		Discriminator: nlri.GetDistinguisher(),
 		Preference:    srpolicy.DefaultPreference, // sub-TLV 不在時の既定 (RFC 9256 §2.7)
+		Priority:      srpolicy.DefaultPriority,   // 同 §2.12 (低い値ほど高優先)
 	}
 	if attrs.tunnelEncap != nil {
 		decodeTunnelEncap(attrs.tunnelEncap, &cp)

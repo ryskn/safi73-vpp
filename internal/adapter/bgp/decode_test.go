@@ -139,6 +139,17 @@ func TestPreferenceDefaults100(t *testing.T) {
 	}
 }
 
+// Priority sub-TLV 不在 → 既定 128 (RFC 9256 §2.12)。0 (最高優先) になってはいけない。
+func TestPriorityDefaults128(t *testing.T) {
+	ev := decodeOK(t, srPath(
+		[]*api.TunnelEncapTLV_TLV{bsid13TLV("2001:db8:b::1"), segListTLV(nil, "2001:db8:c::1")},
+		noAdvComm(),
+	))
+	if ev.Path.Priority != srpolicy.DefaultPriority {
+		t.Fatalf("priority=%d, want %d", ev.Path.Priority, srpolicy.DefaultPriority)
+	}
+}
+
 // SRv6 Binding SID sub-TLV (type 20) は gobgp から Unknown で届く。自前パースで拾う。
 func TestSRv6BindingSIDSubTLV(t *testing.T) {
 	ev := decodeOK(t, srPath(

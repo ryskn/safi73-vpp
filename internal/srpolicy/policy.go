@@ -17,6 +17,10 @@ import (
 // DefaultPreference は Preference sub-TLV 不在時の既定値(RFC 9256 §2.7)。
 const DefaultPreference = 100
 
+// DefaultPriority は Priority sub-TLV 不在時の既定値(RFC 9256 §2.12)。
+// priority は「再計算/再検証の処理順」で、値が小さいほど優先(preference とは逆)。
+const DefaultPriority = 128
+
 // MaxSIDsPerList はこの headend が instantiate できる SID 数の上限。
 // VPP binary API の srv6_sid_list が 16 固定のため。超過は RFC 9256 §5.1 の
 // 「headend が解決できない SID-list」として invalid 扱いにする(切り詰め禁止)。

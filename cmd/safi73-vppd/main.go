@@ -37,6 +37,7 @@ func main() {
 	orphanGC := flag.Bool("orphan-gc", false, "初期同期後、BGP 側に対応 CP が無い VPP 上の SR Policy を削除する (VPP を他の管理主体と共有しているなら無効のまま)")
 	bsidPool := flag.String("bsid-pool", "", "BSID 未指定の CP に動的割当する BSID プール (例 2001:db8:b::/64, RFC 9256 §6.2.1)。未指定なら BSID 無し CP は候補外")
 	verifySIDs := flag.Bool("verify-sids", false, "first SID と V-Flag 付き SID を VPP FIB で解決できない SID-list を invalid にする (RFC 9256 §5.1)")
+	revalidate := flag.Duration("revalidate", 0, "全 SR Policy を priority 順に再検証する間隔 (例 30s, RFC 9256 §2.12)。0 で無効。-verify-sids と併用推奨")
 	usidBlock := flag.String("usid-block", "", "uSID ブロック (例 fcbb:bb00::/32)。指定すると segment list を uSID carrier に圧縮する")
 	usidLen := flag.Int("usid-len", 16, "uSID 長(ビット)")
 	flag.Parse()
@@ -101,6 +102,10 @@ func main() {
 	if *verifySIDs {
 		opts = append(opts, control.WithSIDVerification())
 		log.Info("SID reachability verification enabled (RFC 9256 §5.1)")
+	}
+	if *revalidate > 0 {
+		opts = append(opts, control.WithRevalidation(*revalidate))
+		log.Info("periodic revalidation enabled", "interval", *revalidate)
 	}
 	if *usidBlock != "" {
 		pfx, err := netip.ParsePrefix(*usidBlock)

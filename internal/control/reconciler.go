@@ -3,9 +3,12 @@ package control
 import (
 	"context"
 	"log/slog"
+	"math"
 	"net/netip"
 	"reflect"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/ryskn/safi73-vpp/internal/srpolicy"
 )
@@ -46,14 +49,15 @@ type policyState struct {
 // headend が実際に instantiate する SID-list を変えるため、RFC 9256 §5.1 の妥当性
 // (SID 数上限を含む)は変換後の姿で評価しなければならない。
 type Reconciler struct {
-	source     Source
-	prog       Programmer
-	transform  PolicyTransform
-	log        *slog.Logger
-	orphanGC   bool
-	pool       *bsidPool
-	verifySIDs bool
-	resolver   SIDResolver // verifySIDs 有効時のみ非 nil (Run で解決)
+	source          Source
+	prog            Programmer
+	transform       PolicyTransform
+	log             *slog.Logger
+	orphanGC        bool
+	pool            *bsidPool
+	verifySIDs      bool
+	resolver        SIDResolver // verifySIDs 有効時のみ非 nil (Run で解決)
+	revalidateEvery time.Duration
 
 	mu       sync.Mutex
 	policies map[srpolicy.PolicyKey]*policyState
@@ -103,6 +107,14 @@ func WithSIDVerification() Option {
 	return func(r *Reconciler) { r.verifySIDs = true }
 }
 
+// WithRevalidation は interval ごとに全 SR Policy を再検証する(RFC 9256 §2.12)。
+// 処理順は policy の priority(CP 群の最小値、低い値ほど高優先)に従う。
+// BGP イベントが来なくても、FIB の変化(SID 到達性)や失敗した撤去の再試行を
+// 拾えるようになる。-verify-sids と組み合わせて使うのが典型。
+func WithRevalidation(interval time.Duration) Option {
+	return func(r *Reconciler) { r.revalidateEvery = interval }
+}
+
 // NewReconciler は依存を注入して生成する。
 func NewReconciler(src Source, prog Programmer, log *slog.Logger, opts ...Option) *Reconciler {
 	if log == nil {
@@ -141,7 +153,69 @@ func (r *Reconciler) Run(ctx context.Context) error {
 		}
 	}
 	r.mu.Unlock()
+
+	if r.revalidateEvery > 0 {
+		tctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go r.revalidateLoop(tctx)
+	}
 	return r.source.Subscribe(ctx, r.apply, r.synced)
+}
+
+// revalidateLoop は interval ごとに全 policy を priority 順で再検証する。
+func (r *Reconciler) revalidateLoop(ctx context.Context) {
+	ticker := time.NewTicker(r.revalidateEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.revalidateAll()
+		}
+	}
+}
+
+// revalidateAll は全 SR Policy を priority(低い値 = 高優先, RFC 9256 §2.12)の順に
+// 再検証する。policy の priority は CP 群の signaled priority の最小値(§2.12)。
+func (r *Reconciler) revalidateAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.revalidateLocked()
+}
+
+// revalidateLocked は revalidateAll の本体。r.mu を保持して呼ぶこと。
+func (r *Reconciler) revalidateLocked() {
+	type item struct {
+		key  srpolicy.PolicyKey
+		prio uint32
+	}
+	items := make([]item, 0, len(r.policies))
+	for key, ps := range r.policies {
+		items = append(items, item{key, policyPriority(ps)})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].prio < items[j].prio })
+
+	for _, it := range items {
+		if ps, ok := r.policies[it.key]; ok {
+			r.reconcile(it.key, ps)
+			r.cleanupIfGone(it.key, ps)
+		}
+	}
+}
+
+// policyPriority は SR Policy 全体の priority を返す(CP 群の最小値, §2.12)。
+func policyPriority(ps *policyState) uint32 {
+	if len(ps.cps) == 0 {
+		return ps.installed.Priority
+	}
+	p := uint32(math.MaxUint32)
+	for _, c := range ps.cps {
+		if c.path.Priority < p {
+			p = c.path.Priority
+		}
+	}
+	return p
 }
 
 // refreshOrphans は dataplane の既存 BSID を列挙し、自分が所有していないものを
@@ -225,22 +299,24 @@ func (r *Reconciler) synced() {
 		}
 	}
 
-	if !r.orphanGC {
-		r.orphans = map[netip.Addr]struct{}{}
-		return
-	}
-	rs, ok := r.prog.(Resyncer)
-	if !ok {
-		return
-	}
-	for bsid := range r.orphans {
-		if err := rs.RemoveBSID(bsid); err != nil {
-			r.log.Error("remove orphan SR policy", "bsid", bsid, "err", err)
-			continue
+	if r.orphanGC {
+		if rs, ok := r.prog.(Resyncer); ok {
+			for bsid := range r.orphans {
+				if err := rs.RemoveBSID(bsid); err != nil {
+					r.log.Error("remove orphan SR policy", "bsid", bsid, "err", err)
+					continue
+				}
+				r.log.Info("removed orphan SR policy", "bsid", bsid)
+				delete(r.orphans, bsid)
+			}
 		}
-		r.log.Info("removed orphan SR policy", "bsid", bsid)
-		delete(r.orphans, bsid)
+	} else {
+		r.orphans = map[netip.Addr]struct{}{}
 	}
+
+	// 再同期直後に全 policy を priority 順で再検証する(FIB 変化の取り込み・
+	// 失敗した撤去の再試行)。
+	r.revalidateLocked()
 }
 
 // verifySegmentLists は各 SID-list の first SID と V-Flag 要求 SID を FIB で解決し、
