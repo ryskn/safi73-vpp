@@ -60,6 +60,8 @@ func (c fakeReqCtx) ReceiveReply(msg govppapi.Message) error {
 		if c.ch.lookupReply != nil {
 			*m = *c.ch.lookupReply
 		}
+	case *ipbin.IPRouteAddDelReply:
+		m.Retval = rv
 	default:
 		return fmt.Errorf("fake: unexpected reply type %T", msg)
 	}
@@ -281,6 +283,39 @@ func TestSidListRejectsOversize(t *testing.T) {
 	}
 	if _, err := sidList(sl); err == nil {
 		t.Fatal("want error for oversized segment list")
+	}
+}
+
+// InstallDrop は steering を消して drop 経路を入れ、RemoveDrop はそれを撤去する。
+func TestInstallAndRemoveDrop(t *testing.T) {
+	ch := newFakeChannel()
+	p := NewProgrammer(ch, Options{Encap: true, SteerEndpoint: true}, nil)
+
+	if err := p.InstallDrop(testKey); err != nil {
+		t.Fatal(err)
+	}
+	got := ch.sentNames()
+	if len(got) != 2 || got[0] != "sr_steering_add_del" || got[1] != "ip_route_add_del" {
+		t.Fatalf("sent=%v", got)
+	}
+	route := ch.sent[1].(*ipbin.IPRouteAddDel)
+	if !route.IsAdd || route.Route.Prefix.Len != 128 ||
+		route.Route.Paths[0].Type != fib_types.FIB_API_PATH_TYPE_DROP {
+		t.Fatalf("drop route=%+v", route)
+	}
+
+	if err := p.RemoveDrop(testKey); err != nil {
+		t.Fatal(err)
+	}
+	del := ch.sent[len(ch.sent)-1].(*ipbin.IPRouteAddDel)
+	if del.IsAdd {
+		t.Fatalf("remove drop must send IsAdd=false: %+v", del)
+	}
+
+	// steering 無効構成では drop-steer 不可
+	p = NewProgrammer(newFakeChannel(), Options{Encap: true}, nil)
+	if err := p.InstallDrop(testKey); err == nil {
+		t.Fatal("want error when steering is disabled")
 	}
 }
 

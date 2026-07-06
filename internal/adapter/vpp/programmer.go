@@ -128,6 +128,57 @@ func (p *Programmer) RemoveBSID(bsid netip.Addr) error {
 	return p.deletePolicy(toIP6(bsid))
 }
 
+// InstallDrop は endpoint 宛の steering を drop 経路に差し替える
+// (drop-upon-invalid, RFC 9256 §8.2)。steering 対象外の policy(steering 無効 /
+// null endpoint)には適用できない。
+func (p *Programmer) InstallDrop(key srpolicy.PolicyKey) error {
+	if !p.steerable(key) {
+		return fmt.Errorf("endpoint steering is disabled or endpoint is null; cannot drop-steer")
+	}
+	// steering 削除から drop 投入までの短い間だけ既定経路へ逃げる余地がある
+	// (同一 prefix を FIB source 違いで持たせると優先関係が不定になるため順に入れ替える)。
+	if err := p.steerDel(key.Endpoint); err != nil {
+		p.log.Warn("remove steering before drop", "endpoint", key.Endpoint, "err", err)
+	}
+	return p.dropRoute(true, key.Endpoint)
+}
+
+// RemoveDrop は drop 経路を撤去する(冪等: 対象が無ければ成功扱い)。
+func (p *Programmer) RemoveDrop(key srpolicy.PolicyKey) error {
+	if !key.Endpoint.IsValid() || key.Endpoint.IsUnspecified() {
+		return nil
+	}
+	return p.dropRoute(false, key.Endpoint)
+}
+
+func (p *Programmer) dropRoute(add bool, endpoint netip.Addr) error {
+	var path fib_types.FibPath
+	path.Type = fib_types.FIB_API_PATH_TYPE_DROP
+	route := ip.IPRoute{TableID: p.opts.FIBTable}
+	if endpointIs4(endpoint) {
+		v4 := endpoint.Unmap().As4()
+		path.Proto = fib_types.FIB_API_PATH_NH_PROTO_IP4
+		route.Prefix.Address.Af = ip_types.ADDRESS_IP4
+		route.Prefix.Address.Un.SetIP4(ip_types.IP4Address(v4))
+		route.Prefix.Len = 32
+	} else {
+		path.Proto = fib_types.FIB_API_PATH_NH_PROTO_IP6
+		route.Prefix.Address.Af = ip_types.ADDRESS_IP6
+		route.Prefix.Address.Un.SetIP6(toIP6(endpoint))
+		route.Prefix.Len = 128
+	}
+	route.Paths = []fib_types.FibPath{path}
+
+	reply := &ip.IPRouteAddDelReply{}
+	if err := p.ch.SendRequest(&ip.IPRouteAddDel{IsAdd: add, Route: route}).ReceiveReply(reply); err != nil {
+		return fmt.Errorf("ip_route_add_del drop endpoint=%s: %w", endpoint, err)
+	}
+	if reply.Retval != 0 && add {
+		return fmt.Errorf("ip_route_add_del drop endpoint=%s retval=%d", endpoint, reply.Retval)
+	}
+	return nil // 削除の retval != 0 は冪等扱い(対象無しなど)
+}
+
 // SIDReachable は SID を FIB (opts.FIBTable, encap 後の lookup と同じテーブル) で
 // LPM 解決し、drop 以外の path に解決できるかを返す(RFC 9256 §5.1 の SID 解決)。
 // IPv6 FIB は ::/0 が既定 drop なので「route が引けた」だけでは到達可能とみなさない。

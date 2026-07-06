@@ -34,6 +34,9 @@ type policyState struct {
 	// dynBSID はこの SR Policy に動的に束縛した BSID(RFC 9256 §6.2.1)。
 	// 一度割り当てたら active CP が替わっても policy が生きている間は維持する。
 	dynBSID netip.Addr
+	// dropped は drop-upon-invalid(I-Flag)発動中 = endpoint 宛を drop 経路に
+	// 差し替えている状態(RFC 9256 §8.2)。
+	dropped bool
 }
 
 // Reconciler は Source からの candidate path イベントを集約し、RFC 9256 §2.9 に従って
@@ -183,11 +186,22 @@ func (r *Reconciler) apply(ev srpolicy.Event) {
 	}
 
 	r.reconcile(ev.Key, ps)
+	r.cleanupIfGone(ev.Key, ps)
+}
 
-	if len(ps.cps) == 0 && !ps.hasActive {
-		r.releaseDynBSID(ps)
-		delete(r.policies, ev.Key)
+// cleanupIfGone は CP が 1 本も無くなった policy の状態を片付ける。
+// drop-upon-invalid 発動中なら drop 経路を撤去してから消す(policy が消滅したら
+// fail-closed を維持する根拠も無くなるため)。撤去に失敗したら状態を残して再試行に回す。
+// r.mu を保持して呼ぶこと。
+func (r *Reconciler) cleanupIfGone(key srpolicy.PolicyKey, ps *policyState) {
+	if len(ps.cps) != 0 || ps.hasActive {
+		return
 	}
+	if ps.dropped && !r.removeDrop(key, ps) {
+		return
+	}
+	r.releaseDynBSID(ps)
+	delete(r.policies, key)
 }
 
 // synced は初期同期完了時に呼ばれる。前世代の残骸 CP を掃除し、
@@ -207,10 +221,7 @@ func (r *Reconciler) synced() {
 		if dirty {
 			r.log.Info("swept stale candidate paths after resync", "policy", key.String())
 			r.reconcile(key, ps)
-			if len(ps.cps) == 0 && !ps.hasActive {
-				r.releaseDynBSID(ps)
-				delete(r.policies, key)
-			}
+			r.cleanupIfGone(key, ps)
 		}
 	}
 
@@ -270,6 +281,43 @@ func (r *Reconciler) verifySegmentLists(key srpolicy.PolicyKey, sls []srpolicy.S
 		}
 	}
 	return out
+}
+
+// installDrop は drop-upon-invalid を発動する。dataplane が対応しない構成
+// (InvalidDropper 未実装、steering 無効、null endpoint)では警告して
+// 既定動作(削除 = IGP フォールバック)のままにする。r.mu を保持して呼ぶこと。
+func (r *Reconciler) installDrop(key srpolicy.PolicyKey, ps *policyState) {
+	d, ok := r.prog.(InvalidDropper)
+	if !ok {
+		r.log.Warn("drop-upon-invalid (I-Flag) requested but dataplane does not support it; falling back to removal",
+			"policy", key.String())
+		return
+	}
+	if err := d.InstallDrop(key); err != nil {
+		r.log.Warn("drop-upon-invalid (I-Flag) could not be engaged; falling back to removal",
+			"policy", key.String(), "err", err)
+		return
+	}
+	ps.dropped = true
+	r.log.Info("drop-upon-invalid engaged: steered traffic is dropped while policy is invalid",
+		"policy", key.String(), "endpoint", key.Endpoint)
+}
+
+// removeDrop は drop 経路を撤去する。失敗時は dropped を維持し false を返す
+// (呼び出し側は処理を中断して次イベントで再試行する)。r.mu を保持して呼ぶこと。
+func (r *Reconciler) removeDrop(key srpolicy.PolicyKey, ps *policyState) bool {
+	d, ok := r.prog.(InvalidDropper)
+	if !ok {
+		ps.dropped = false
+		return true
+	}
+	if err := d.RemoveDrop(key); err != nil {
+		r.log.Error("remove drop route; will retry", "policy", key.String(), "err", err)
+		return false
+	}
+	ps.dropped = false
+	r.log.Info("drop-upon-invalid released", "policy", key.String())
+	return true
 }
 
 // ensureDynBSID は policy に動的 BSID を割り当てる(割当済みなら何もしない)。
@@ -345,10 +393,6 @@ func (r *Reconciler) reconcile(key srpolicy.PolicyKey, ps *policyState) {
 		if !ps.hasActive {
 			return
 		}
-		if ps.installed.DropUponInvalid {
-			r.log.Warn("drop-upon-invalid (I-Flag) requested but not supported by dataplane; falling back to removal",
-				"policy", key.String())
-		}
 		if err := r.prog.Remove(key, ps.installed); err != nil {
 			// 状態は保持して次のイベントで撤去を再試行する(忘れると dataplane に
 			// policy が残ったまま管理から漏れる)。
@@ -360,6 +404,9 @@ func (r *Reconciler) reconcile(key srpolicy.PolicyKey, ps *policyState) {
 		delete(r.bsidOwner, ps.installed.BSID)
 		ps.hasActive = false
 		ps.activeKey = srpolicy.CPKey{}
+		if ps.installed.DropUponInvalid {
+			r.installDrop(key, ps) // I-Flag: 既定経路へ逃さず drop (§8.2)
+		}
 		return
 	}
 
@@ -375,6 +422,11 @@ func (r *Reconciler) reconcile(key srpolicy.PolicyKey, ps *policyState) {
 		}
 		delete(r.bsidOwner, ps.installed.BSID)
 	} else {
+		// drop-upon-invalid から復帰する場合は drop 経路を先に外す
+		// (steering と同一 prefix のため、残すとどちらが勝つか FIB source 優先度依存になる)。
+		if ps.dropped && !r.removeDrop(key, ps) {
+			return
+		}
 		if err := r.prog.Add(key, active); err != nil {
 			r.log.Error("add", "policy", key.String(), "err", err)
 			return

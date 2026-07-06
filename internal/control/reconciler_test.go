@@ -23,6 +23,10 @@ type fakeProgrammer struct {
 
 	unreachable map[netip.Addr]bool // SIDReachable が false を返す SID
 	resolveErr  error               // SIDReachable が返すエラー
+
+	dropInstalled []srpolicy.PolicyKey // InstallDrop された policy
+	dropRemoved   []srpolicy.PolicyKey // RemoveDrop された policy
+	failDrop      bool
 }
 
 func (f *fakeProgrammer) Add(_ srpolicy.PolicyKey, cp srpolicy.CandidatePath) error {
@@ -60,6 +64,19 @@ func (f *fakeProgrammer) SIDReachable(sid netip.Addr) (bool, error) {
 		return false, f.resolveErr
 	}
 	return !f.unreachable[sid], nil
+}
+
+func (f *fakeProgrammer) InstallDrop(key srpolicy.PolicyKey) error {
+	if f.failDrop {
+		return fmt.Errorf("drop failed")
+	}
+	f.dropInstalled = append(f.dropInstalled, key)
+	return nil
+}
+
+func (f *fakeProgrammer) RemoveDrop(key srpolicy.PolicyKey) error {
+	f.dropRemoved = append(f.dropRemoved, key)
+	return nil
 }
 
 // lastActive は「いま dataplane で active な CP」相当(最後の add/replace 結果)。
@@ -391,6 +408,63 @@ func TestSIDVerificationFailOpen(t *testing.T) {
 	}
 	if len(fp.added) != 1 {
 		t.Fatalf("added=%d, want 1 (fail-open on lookup error)", len(fp.added))
+	}
+}
+
+// drop-upon-invalid (I-Flag, RFC 9256 §8.2):
+// invalid 化 → 削除 + drop 投入 / 復帰 → drop 解除 + 再投入 / 全 withdraw → drop 撤去。
+func TestDropUponInvalid(t *testing.T) {
+	valid := cpEvent(1, 100, "2001:db8:b::1", false)
+	valid.Path.DropUponInvalid = true
+	invalid := cpEvent(1, 100, "2001:db8:b::1", false)
+	invalid.Path.DropUponInvalid = true
+	invalid.Path.SegmentLists = []srpolicy.SegmentList{{Weight: 0, SIDs: []netip.Addr{mustAddr("2001:db8:c::1")}}}
+
+	// valid → invalid: policy 削除 + drop 発動
+	fp := run(t, []srpolicy.Event{valid, invalid})
+	if len(fp.removed) != 1 || len(fp.dropInstalled) != 1 || fp.dropInstalled[0] != polKey {
+		t.Fatalf("removed=%d dropInstalled=%v, want removal + drop engaged", len(fp.removed), fp.dropInstalled)
+	}
+
+	// invalid → valid: drop 解除してから再投入
+	fp = run(t, []srpolicy.Event{valid, invalid, valid})
+	if len(fp.dropRemoved) != 1 || len(fp.added) != 2 {
+		t.Fatalf("dropRemoved=%d added=%d, want drop released then reinstalled", len(fp.dropRemoved), len(fp.added))
+	}
+
+	// 全 withdraw: policy 消滅 → drop も撤去される (fail-closed の根拠が無くなる)
+	wd := cpEvent(1, 100, "2001:db8:b::1", true)
+	fp = run(t, []srpolicy.Event{valid, invalid, wd})
+	if len(fp.dropRemoved) != 1 {
+		t.Fatalf("dropRemoved=%d, want drop removed when policy ceases to exist", len(fp.dropRemoved))
+	}
+}
+
+// I-Flag 無しの CP は従来どおり削除のみ (IGP フォールバック)。
+func TestNoDropWithoutIFlag(t *testing.T) {
+	fp := run(t, []srpolicy.Event{
+		cpEvent(1, 100, "2001:db8:b::1", false),
+		cpEvent(1, 100, "2001:db8:b::1", true),
+	})
+	if len(fp.dropInstalled) != 0 {
+		t.Fatalf("dropInstalled=%v, want none without I-Flag", fp.dropInstalled)
+	}
+}
+
+// drop 投入に失敗したら既定動作 (削除のみ) にフォールバックし、状態は down のまま。
+func TestDropFailureFallsBackToRemoval(t *testing.T) {
+	valid := cpEvent(1, 100, "2001:db8:b::1", false)
+	valid.Path.DropUponInvalid = true
+	fp := &fakeProgrammer{failDrop: true}
+	r := NewReconciler(sliceSource{[]srpolicy.Event{
+		valid,
+		cpEvent(1, 100, "2001:db8:b::1", true),
+	}}, fp, nil)
+	if err := r.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(fp.removed) != 1 || len(fp.dropInstalled) != 0 {
+		t.Fatalf("removed=%d dropInstalled=%d, want removal only", len(fp.removed), len(fp.dropInstalled))
 	}
 }
 

@@ -28,6 +28,7 @@ func main() {
 	pref := flag.Uint("preference", 100, "SR Policy preference")
 	prio := flag.Uint("priority", 0, "SR Policy priority")
 	rt := flag.String("rt", "", "Route Target (対象 headend の BGP router-id, カンマ区切り可)。省略時は NO_ADVERTISE を付ける (RFC 9830 §4.1)")
+	dropInvalid := flag.Bool("drop-upon-invalid", false, "BSID sub-TLV に I-Flag を立てる (invalid 時に drop, RFC 9256 §8.2)")
 	withdraw := flag.Bool("withdraw", false, "withdraw instead of add")
 	flag.Parse()
 
@@ -59,7 +60,7 @@ func main() {
 			Tlv: &api.TunnelEncapTLV_TLV_SrBindingSid{
 				SrBindingSid: &api.TunnelEncapSubTLVSRBindingSID{
 					Bsid: &api.TunnelEncapSubTLVSRBindingSID_SrBindingSid{
-						SrBindingSid: &api.SRBindingSID{Sid: net.ParseIP(*bsid).To16()},
+						SrBindingSid: &api.SRBindingSID{Sid: net.ParseIP(*bsid).To16(), IFlag: *dropInvalid},
 					},
 				},
 			},
