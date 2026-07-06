@@ -1,6 +1,7 @@
 package srpolicy
 
 import (
+	"fmt"
 	"net/netip"
 	"testing"
 )
@@ -36,6 +37,26 @@ func TestSegmentListValidity(t *testing.T) {
 	}
 	if sl(1, "10.0.0.1").Valid() {
 		t.Error("non-IPv6 SID must be invalid")
+	}
+
+	// 混在 segment type (RFC 9256 §5.1): 部分的に使わず list ごと invalid
+	mixed := sl(1, "2001:db8::1")
+	mixed.Unsupported = true
+	if mixed.Valid() {
+		t.Error("list containing unsupported segment types must be invalid")
+	}
+
+	// headend 上限超過は切り詰めず invalid
+	over := SegmentList{Weight: 1}
+	for i := 0; i <= MaxSIDsPerList; i++ {
+		over.SIDs = append(over.SIDs, netip.MustParseAddr(fmt.Sprintf("2001:db8:c::%x", i+1)))
+	}
+	if over.Valid() {
+		t.Errorf("list with %d SIDs (> %d) must be invalid", len(over.SIDs), MaxSIDsPerList)
+	}
+	atLimit := SegmentList{Weight: 1, SIDs: over.SIDs[:MaxSIDsPerList]}
+	if !atLimit.Valid() {
+		t.Errorf("list with exactly %d SIDs should be valid", MaxSIDsPerList)
 	}
 }
 

@@ -27,6 +27,7 @@ func main() {
 	weights := flag.String("weights", "", "各 SID-list の weight (カンマ区切り 例 1,3)。省略時は全て 1")
 	pref := flag.Uint("preference", 100, "SR Policy preference")
 	prio := flag.Uint("priority", 0, "SR Policy priority")
+	rt := flag.String("rt", "", "Route Target (対象 headend の BGP router-id, カンマ区切り可)。省略時は NO_ADVERTISE を付ける (RFC 9830 §4.1)")
 	withdraw := flag.Bool("withdraw", false, "withdraw instead of add")
 	flag.Parse()
 
@@ -62,7 +63,7 @@ func main() {
 	}
 	for i, group := range strings.Split(*segs, ";") {
 		var segList []*api.TunnelEncapSubTLVSRSegmentList_Segment
-		for _, s := range strings.Split(group, ",") {
+		for s := range strings.SplitSeq(group, ",") {
 			if s = strings.TrimSpace(s); s == "" {
 				continue
 			}
@@ -100,6 +101,28 @@ func main() {
 		{Attr: &api.Attribute_TunnelEncap{TunnelEncap: &api.TunnelEncapAttribute{
 			Tlvs: []*api.TunnelEncapTLV{{Type: 15, Tlvs: subTLVs}},
 		}}},
+	}
+	// RFC 9830 §4.1: RT を付けるか、無ければ NO_ADVERTISE を必ず付ける。
+	if *rt != "" {
+		var comms []*api.ExtendedCommunity
+		for target := range strings.SplitSeq(*rt, ",") {
+			comms = append(comms, &api.ExtendedCommunity{
+				Extcom: &api.ExtendedCommunity_Ipv4AddressSpecific{
+					Ipv4AddressSpecific: &api.IPv4AddressSpecificExtended{
+						IsTransitive: true,
+						SubType:      0x02, // Route Target
+						Address:      strings.TrimSpace(target),
+					},
+				},
+			})
+		}
+		pattrs = append(pattrs, &api.Attribute{Attr: &api.Attribute_ExtendedCommunities{
+			ExtendedCommunities: &api.ExtendedCommunitiesAttribute{Communities: comms},
+		}})
+	} else {
+		pattrs = append(pattrs, &api.Attribute{Attr: &api.Attribute_Communities{
+			Communities: &api.CommunitiesAttribute{Communities: []uint32{0xFFFFFF02}}, // NO_ADVERTISE
+		}})
 	}
 
 	path := &api.Path{

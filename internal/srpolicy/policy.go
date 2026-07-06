@@ -14,16 +14,28 @@ import (
 	"net/netip"
 )
 
+// DefaultPreference は Preference sub-TLV 不在時の既定値(RFC 9256 §2.7)。
+const DefaultPreference = 100
+
+// MaxSIDsPerList はこの headend が instantiate できる SID 数の上限。
+// VPP binary API の srv6_sid_list が 16 固定のため。超過は RFC 9256 §5.1 の
+// 「headend が解決できない SID-list」として invalid 扱いにする(切り詰め禁止)。
+const MaxSIDsPerList = 16
+
 // SegmentList は candidate path 1 本分の SID 列と重み。
 type SegmentList struct {
 	Weight uint32
 	SIDs   []netip.Addr
+	// Unsupported は SRv6 以外(SR-MPLS 等)の segment type を含んでいたことを示す。
+	// RFC 9256 §5.1: SR-MPLS と SRv6 の混在 list は invalid(部分的に使うのは禁止)。
+	Unsupported bool
 }
 
 // Valid は RFC 9256 §5.1 に従い SID-list の妥当性を返す。
-// 空 / weight==0 / 非 IPv6(SRv6でない) SID を含む場合は invalid。
+// 空 / weight==0 / 非 IPv6(SRv6でない) SID / 混在 segment type /
+// headend 上限(MaxSIDsPerList)超過は invalid。
 func (sl SegmentList) Valid() bool {
-	if len(sl.SIDs) == 0 || sl.Weight == 0 {
+	if sl.Unsupported || len(sl.SIDs) == 0 || len(sl.SIDs) > MaxSIDsPerList || sl.Weight == 0 {
 		return false
 	}
 	for _, s := range sl.SIDs {
@@ -75,10 +87,10 @@ func (k PolicyKey) String() string {
 
 // CPKey は candidate path の一意キー <protocol-origin, originator, discriminator>。
 type CPKey struct {
-	Origin        ProtocolOrigin
-	OriginatorASN uint32
+	Origin         ProtocolOrigin
+	OriginatorASN  uint32
 	OriginatorNode netip.Addr
-	Discriminator uint32
+	Discriminator  uint32
 }
 
 // CandidatePath は SR Policy の候補パス 1 本(BGP の 1 NLRI+attrs に対応)。
@@ -91,6 +103,13 @@ type CandidatePath struct {
 	Priority     uint32
 	BSID         netip.Addr
 	SegmentLists []SegmentList
+
+	// SpecifiedBSIDOnly は BSID sub-TLV の S-Flag(RFC 9256 §6.2.3)。
+	// この実装は VPP が BSID をキーとする都合で常に Specified-BSID-only 相当で動く。
+	SpecifiedBSIDOnly bool
+	// DropUponInvalid は BSID sub-TLV の I-Flag(RFC 9256 §8.2)。
+	// VPP dataplane に相当機能が無いため未対応(検出してログのみ)。
+	DropUponInvalid bool
 }
 
 // Key は candidate path の一意キーを返す。
@@ -99,7 +118,11 @@ func (cp CandidatePath) Key() CPKey {
 }
 
 // Valid は RFC 9256 に従い CP の妥当性を返す。
-// BSID が SRv6(IPv6) かつ valid な SID-list を 1 本以上持てば valid。
+// valid な SID-list を 1 本以上持ち、かつ BSID が SRv6(IPv6) であれば valid。
+//
+// BSID 必須は RFC 9256(§6.2.1 では BSID 無し CP も動的割当で instantiate 可)からの
+// 意図的な逸脱で、VPP が BSID を SR Policy のキーにするための
+// Specified-BSID-only(§6.2.3)相当の動作。
 func (cp CandidatePath) Valid() bool {
 	if !cp.BSID.Is6() || cp.BSID.Is4In6() {
 		return false

@@ -15,8 +15,9 @@ func (c Compactor) Apply(cp srpolicy.CandidatePath) srpolicy.CandidatePath {
 	out.SegmentLists = make([]srpolicy.SegmentList, len(cp.SegmentLists))
 	for i, sl := range cp.SegmentLists {
 		out.SegmentLists[i] = srpolicy.SegmentList{
-			Weight: sl.Weight,
-			SIDs:   c.Block.Compact(sl.SIDs),
+			Weight:      sl.Weight,
+			SIDs:        c.Block.Compact(sl.SIDs),
+			Unsupported: sl.Unsupported, // 妥当性判定は圧縮後に行われるため必ず引き継ぐ
 		}
 	}
 	return out

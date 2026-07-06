@@ -42,9 +42,35 @@ func (b Block) Contains(addr netip.Addr) bool {
 	return addr.Is6() && b.Prefix.Contains(addr)
 }
 
+// isSingleUSID は addr が「block + uSID 1 個 + 残り全ゼロ」の形かを返す。
+// block 配下でも、複数 uSID が既に詰まった carrier や uSID 部が全ゼロのアドレスは
+// 単一 uSID ではないので圧縮してはいけない(ビットを黙って落とすことになる)。
+func (b Block) isSingleUSID(addr netip.Addr) bool {
+	blockBytes := b.Prefix.Bits() / 8
+	usidBytes := b.USIDBits / 8
+	s := addr.As16()
+
+	usidZero := true
+	for _, x := range s[blockBytes : blockBytes+usidBytes] {
+		if x != 0 {
+			usidZero = false
+			break
+		}
+	}
+	if usidZero {
+		return false
+	}
+	for _, x := range s[blockBytes+usidBytes:] {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Compact は block 配下の単一 uSID アドレス列を、最小数の carrier に詰め直す。
-// block 外のアドレスは圧縮対象外として、その時点の carrier を確定し単独で温存する
-// (mixed list でも順序と意味を壊さない)。
+// 圧縮対象外のアドレス(block 外、または単一 uSID の形でないもの)は、その時点の
+// carrier を確定し単独で温存する(mixed list でも順序と意味を壊さない)。
 func (b Block) Compact(sids []netip.Addr) []netip.Addr {
 	blockBytes := b.Prefix.Bits() / 8
 	usidBytes := b.USIDBits / 8
@@ -65,7 +91,7 @@ func (b Block) Compact(sids []netip.Addr) []netip.Addr {
 	}
 
 	for _, sid := range sids {
-		if !b.Contains(sid) {
+		if !b.Contains(sid) || !b.isSingleUSID(sid) {
 			flush()
 			out = append(out, sid) // 圧縮対象外はそのまま
 			continue
